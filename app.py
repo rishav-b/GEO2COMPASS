@@ -14,7 +14,7 @@ from urllib.parse import urljoin
 
 # PyArrow 25.0.0 can segfault when Streamlit initializes Arrow from a
 # ScriptRunner thread. Use the system allocator even if the deployment
-# environment does not define this variable.
+# environment does not define this variable .
 os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
 
 import GEOparse
