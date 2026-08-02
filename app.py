@@ -185,17 +185,18 @@ def get_dp_and_char(gse, meta):
     for gsm in meta["gsm_ids"]:
         gsm_data = gse.gsms[gsm]
         new_row = {}
+   
         for x in gsm_data.metadata.get("characteristics_ch1", []):
             if ": " in x:
                 key, value = x.split(": ", 1)
                 new_row[key] = value
             else:
                 new_row[x] = x
-        char_df.loc[gsm_data.metadata["geo_accession"][0]] = new_row
-        if "treatment_protocol_ch1" in gsm_data.metadata.keys():
-            char_df.loc[gsm_data.metadata["geo_accession"][0], "treatment_protocol"] = gsm_data.metadata["treatment_protocol_ch1"][0]
-        if "growth_protocol_ch1" in gsm_data.metadata.keys():
-            char_df.loc[gsm_data.metadata["geo_accession"][0], "growth_protocol"] = gsm_data.metadata["growth_protocol_ch1"][0]
+        if "characteristics_ch1" in gsm_data.metadata:
+            char_df.loc[gsm_data.metadata["geo_accession"][0]] = new_row
+        for key in ["treatment_protocol_ch1", "growth_protocol_ch1", "organism_ch1", "source_name_ch1", "title"]:
+            if key in gsm_data.metadata:
+                char_df.loc[gsm_data.metadata["geo_accession"][0], key] = gsm_data.metadata[key][0]
     st.session_state["char_df"] = char_df.astype("string")
 
 try:
