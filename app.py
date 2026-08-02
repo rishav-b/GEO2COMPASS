@@ -9,7 +9,7 @@ import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urljoin
 
 # PyArrow 25.0.0 can segfault when Streamlit initializes Arrow from a
@@ -30,8 +30,15 @@ st.title("GEO-2-COMPASS")
 
 MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 MAX_MATRIX_CELLS = 20_000_000
+MAX_LOADED = 2
 PREVIEW_ROWS = 1_000
 PREVIEW_COLUMNS = 50
+
+loaded_keys = [k for k in st.session_state.keys() if k.startswith("df_")]
+if len(loaded_keys) >= MAX_LOADED:
+    oldest = loaded_keys[0]  # or track load order explicitly
+    for k in (oldest, oldest.replace("df_", "dl_bytes_")):
+        st.session_state.pop(k, None)
 
 with st.form("geo_accession_form"):
     requested_gse_id = st.text_input(
@@ -47,6 +54,11 @@ if load_accession:
         st.error("Enter a valid GEO Series accession, such as GSE183620.")
         st.stop()
     if requested_gse_id != st.session_state.get("active_gse_id"):
+        old_gse_id = st.session_state.get("active_gse_id")
+        if old_gse_id:
+            geo_cache_dir = Path("./geo_cache")
+            for f in geo_cache_dir.glob(f"{old_gse_id}_*.parquet"):
+                f.unlink(missing_ok=True)
         st.session_state.clear()
         st.session_state["active_gse_id"] = requested_gse_id
         st.rerun()
@@ -128,13 +140,16 @@ def fetch_metadata(gse_id: str, gse) -> dict:
 )
 def get_gse(gse_id):
     url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{gse_id[:-3]}nnn/{gse_id}/soft/{gse_id}_family.soft.gz"
-
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GEO-2-COMPASS/1.0; contact: your_email@example.com)"
+    }
     print(f" [Downloading] Fetching data directly from: {url}")
 
     try:
         with requests.get(
             url,
             stream=True,
+            headers=headers,
             timeout=(30, 300),
         ) as response:
             response.raise_for_status()
@@ -553,10 +568,14 @@ def classify_normalization(dp_text: str) -> str:
 
 def _download_bytes(url: str) -> Optional[bytes]:
     url = url.replace("ftp://", "https://", 1)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; GEO-2-COMPASS/1.0; contact: your_email@example.com)"
+    }
     with requests.get(
         url,
         stream=True,
         timeout=(30, 300),
+        headers=headers,
     ) as resp:
         resp.raise_for_status()
 
@@ -715,6 +734,7 @@ def _parse_tabular_series(raw: bytes, filename: str) -> tuple[pd.Series, str]:
     stem = re.sub(r"\.(csv|tsv|txt|tab)$", "", stem, flags=re.IGNORECASE)
     return s, stem
 
+
 def _build_matrix_from_tar(url_bytes, file_meta):
     series_list = []
 
@@ -727,6 +747,7 @@ def _build_matrix_from_tar(url_bytes, file_meta):
                 if not member.isfile():
                     continue
                 mname = Path(member.name).name
+                
                 if not _is_tabular(mname):
                     continue
                 extracted = tf.extractfile(member)
@@ -871,10 +892,11 @@ def _read_dp_text(geo, accession):
 def fetch_and_normalize(
     selected_gpl,
     accession:     str,
+    gsm_ids:      Optional[list[str]] = None,
     geo_cache_dir: str | Path = "./geo_cache",
     save_output:   bool       = False,
     output_dir:    str | Path = "./geo_output",
-) -> list[GseResult]:
+) -> list[dict[str, Any]]:
 
     geo_cache_dir = Path(geo_cache_dir)
     geo_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -886,115 +908,79 @@ def fetch_and_normalize(
     dp_text  = st.session_state["dp_text"]
  
     candidates = _scrape_geo_download_page(accession)
+    inferred_norm = classify_normalization(dp_text)
     if not candidates:
         return []
 
-    selected_candidates, inferred_norm = select_download_urls(
-        candidates,
-        accession,
-        classify_normalization(dp_text),
-    )
-
-    results = []
+    results_meta = []
 
     # Process one matrix per run. The previous implementation retained every
     # raw/FPKM/TPM candidate simultaneously and could exceed Railway memory.
-    for c in selected_candidates:
+    for c in candidates:
         selected = [c]
         if c.normalization == "unknown":
             c.normalization = inferred_norm
-        print(f"\n  Selected {len(selected)} file(s) to download:")
-        for m in selected:
-            print(f"    {'[TAR]' if m.is_tar else '     '} {m.filename}")
-    
-        url_bytes = _download_all([m.url for m in selected])
 
+        print(f"\n  Processing: {c.filename}")
+
+        url_bytes = _download_all([c.url])
         if url_bytes.get(c.url) is None:
-            print(f"Exceeded file size, skipping this file {c.url}")
+            print(f"    Exceeded file size, skipping {c.url}")
             continue
 
-        print("\n  Building count matrix…")
         counts_df = _fetch_counts_df(accession, selected, url_bytes)
         del url_bytes
         gc.collect()
-        
+
         if counts_df.empty:
             continue
 
         if counts_df.size > MAX_MATRIX_CELLS:
-            raise MemoryError(
-                "The selected matrix contains "
-                f"{counts_df.size:,} cells, above this deployment's "
-                f"{MAX_MATRIX_CELLS:,}-cell safety limit."
-            )
-        
+            print(f"    Skipping {c.filename}: {counts_df.size:,} cells exceeds "
+                  f"{MAX_MATRIX_CELLS:,}-cell limit")
+            continue
+
         counts_df = _annotate_counts(accession, selected, counts_df, selected_gpl)
         counts_df = reduce_matrix_memory(counts_df)
-        
-        result = GseResult(
-            accession=accession,
-            normalization_type=c.normalization,
-            effective_norm=None,
-            counts_df=counts_df,
-            norm_df=None
-        )
 
-        results.append(result)
+        retained_cols = [
+            col for col in counts_df.columns
+            if "gsm" not in col.lower() or any(gsm in col for gsm in gsm_ids)
+        ]
 
-    if save_output:
-        for result in results:
-            result.save(output_dir)
+        counts_df = counts_df[retained_cols]
+        counts_df.index.name = None
+        counts_df.insert(0, "Name", counts_df.index)
+        counts_df.reset_index(drop=True, inplace=True)
 
-    return results
+        cache_path = geo_cache_dir / f"{accession}_{c.filename}_{id(c)}.parquet"
+        counts_df.to_parquet(cache_path, compression="gzip")
+
+        results_meta.append({
+            "path": cache_path,
+            "filename": c.filename,
+            "normalization_type": c.normalization,
+            "n_genes": counts_df.shape[0],
+            "n_samples": counts_df.shape[1] - 1,
+        })
+
+        del counts_df
+        gc.collect()
+
+    return results_meta
 
 def fetch_rnaseq_matrix(gse_id: str, meta):
     try:
-        results = fetch_and_normalize(
+        return fetch_and_normalize(
             selected_gpl=st.session_state.selected_gpl,
             accession=gse_id,
+            gsm_ids=meta["gsm_ids"],
             geo_cache_dir="./geo_cache",
             save_output=False,
         )
     except Exception as e:
         st.error(f"geo_rnaseq_normalizer error: {e}")
         return None
-    
-    result_lists = []
-
-    for result in results:
-        if result.counts_df is None or result.counts_df.empty:
-            continue
-        retained_cols = [
-            col
-            for col in result.counts_df.columns
-            if "gsm" not in col.lower()
-            or any(gsm in col for gsm in meta["gsm_ids"])
-        ]
-        dropped_cols = [
-            col for col in result.counts_df.columns
-            if col not in retained_cols
-        ]
-        df = result.counts_df
-        if dropped_cols:
-            df.drop(columns=dropped_cols, inplace=True)
-        df.index.name = None
-        df.insert(0, "Name", df.index)
-        df.reset_index(drop=True, inplace=True)
-
-        st.info(
-            f"Original normalization: **{result.normalization_type}** "
-        )
-
-        #print(df)
-
-        result_list = [df, result.normalization_type, "none"]
-        result_lists.append(result_list)
-        result.counts_df = None
-        result.norm_df = None
-
-    gc.collect()
-
-    return result_lists
 
 # # # # # # # # # # # # # # # #
 # MICROARRAY DATASET HANDLING # 
@@ -1061,9 +1047,21 @@ def fetch_microarray_matrix(meta: dict):
     final_df = _annotate_matrix(final_df)
     final_df = reduce_matrix_memory(final_df)
 
-    norm_type = "none"
+    geo_cache_dir = Path("./geo_cache")
+    geo_cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = geo_cache_dir / f"{gse_id}_microarray.parquet"
+    final_df.to_parquet(cache_path, compression="gzip")
 
-    return [[final_df, summ_norm, norm_type]]
+    meta_entry = {
+        "path": cache_path,
+        "filename": "microarray_matrix",
+        "normalization_type": summ_norm,
+        "n_genes": final_df.shape[0],
+        "n_samples": final_df.shape[1] - 1,
+    }
+    del final_df
+    gc.collect()
+    return [meta_entry]
 
 @st.cache_data(show_spinner=False, max_entries=2)
 def dataframe_to_gzip_tsv(df: pd.DataFrame) -> bytes:
@@ -1155,7 +1153,7 @@ def survival_metadata_ui(char_df):
         )
 
 @st.fragment
-def annotate_columns(i, char_df, gse_id, df_key):
+def annotate_columns(i, char_df, gse_id, df_key, source_path):
     with st.expander("Annotate Columns", expanded=False):
         st.write("Replace GSM column names with sample data")
 
@@ -1177,11 +1175,11 @@ def annotate_columns(i, char_df, gse_id, df_key):
                 for gsm in char_df.index:
                     column_mapping[gsm] = "_".join([str(char_df[x].loc[gsm]) for x in current_selection]) + f"_{gsm}"
 
-            base_df = st.session_state[f"base_df_{i}"].copy()
+            base_df = pd.read_parquet(source_path)
 
             current_norm = st.session_state.get(f"norm_type_{i}", "none")
             if current_norm != "none":
-                base_df = apply_norm(base_df, current_norm, st.session_state.get("selected_columns", list(base_df.columns)), i)
+                base_df = apply_norm(base_df, current_norm, st.session_state.get(f"selected_columns_{i}", list(base_df.columns)), i, meta_entry["path"])
 
             st.session_state[df_key] = base_df.rename(columns=column_mapping)
 
@@ -1248,7 +1246,8 @@ def column_selector(counts_df, i, gse_id):
     
     return selected_columns
 
-def apply_norm(df, norm, col_list, i):
+def apply_norm(df, norm, col_list, i, source_path):
+    base_df = pd.read_parquet(source_path)
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     numeric_cols = [n for n in numeric_cols if n in col_list]
     
@@ -1258,16 +1257,19 @@ def apply_norm(df, norm, col_list, i):
     for col in numeric_cols:
         gsm_id = col.split("_")[-1]  
         
-        if gsm_id in st.session_state[f"base_df_{i}"].columns:
+        if gsm_id in base_df.columns:
             base_gsm_cols.append(gsm_id)
             valid_numeric_cols.append(col)
-        elif col in st.session_state[f"base_df_{i}"].columns:
+        elif col in base_df.columns:
             base_gsm_cols.append(col)
             valid_numeric_cols.append(col)
 
     if not base_gsm_cols:
         return df  
-    numeric_df = st.session_state[f"base_df_{i}"][base_gsm_cols].copy()
+    
+    numeric_df = base_df[base_gsm_cols]
+
+    del base_df
     
     numeric_df.columns = valid_numeric_cols
     if norm == "none":
@@ -1311,7 +1313,7 @@ if st.button("Fetch & Build Matrix", type="primary"):
     st.session_state.result_lists = None
 
     for key in list(st.session_state.keys()):
-        if key.startswith("df_") or key.startswith("base_df_") or key.startswith("norm_type_"):
+        if str(key).startswith(("df_", "base_df_", "norm_type_", "preview_", "dl_bytes_", "selected_cols_dict_", "pill_selector_")):
             del st.session_state[key]
     
 
@@ -1338,31 +1340,7 @@ if st.session_state.run_pipeline and st.session_state.result_lists is None:
 if st.session_state.result_lists is not None:
     result_lists = st.session_state.result_lists
     survival_metadata_ui(st.session_state.char_df) 
-
-    for i in range(len(result_lists)):
-        if f"norm_type_{i}" not in st.session_state:
-            st.session_state[f"norm_type_{i}"] = "none"
-        result_list = result_lists[i]
-        combined_df = result_list[0]
-        if f"base_df_{i}" not in st.session_state:
-            st.session_state[f"base_df_{i}"] = combined_df
-    
-        df_key = f"df_{i}"
-
-        if df_key not in st.session_state:
-            combined_df_copy = combined_df.copy()
-            combined_df_copy.insert(0, 'Name', combined_df_copy.pop('Name'))
-            st.session_state[df_key] = combined_df_copy
-
-        df = st.session_state[df_key]
-        
-        original_normalization = result_list[1]
-        effective_normalization = result_list[2]
-        n_genes   = combined_df.shape[0]
-        n_samples = combined_df.shape[1] - (1 if "Name" in combined_df.columns else 0)
-        st.markdown(body = "<hr>", unsafe_allow_html= True)
-        c4, c5 = st.columns(2)
-        st.markdown("""
+    st.markdown("""
         <style>
             .normalization { 
                 font-size: 16px !important; 
@@ -1390,6 +1368,25 @@ if st.session_state.result_lists is not None:
                     
         </style>
         """, unsafe_allow_html=True)
+    
+    for i, meta_entry in enumerate(result_lists):
+        if f"norm_type_{i}" not in st.session_state:
+            st.session_state[f"norm_type_{i}"] = "none"
+        
+        df_key = f"df_{i}"
+        preview_key = f"preview_{i}"
+
+        if preview_key not in st.session_state:
+            st.session_state[preview_key] = pd.read_parquet(meta_entry["path"]).head(PREVIEW_ROWS)
+
+        original_normalization = meta_entry["normalization_type"]
+        n_genes = meta_entry["n_genes"]
+        n_samples = meta_entry["n_samples"]
+
+        st.markdown(body = "<hr>", unsafe_allow_html= True)
+        st.caption(f"**{meta_entry['filename']}**")
+        c4, c5 = st.columns(2)
+        
         
         with c4:
             st.markdown(body=f'<div class = "container"><p class = "normalization">Original Normalization</p> <p class = "normtext">{original_normalization}</p></div>', unsafe_allow_html = True)
@@ -1401,8 +1398,41 @@ if st.session_state.result_lists is not None:
         c1.metric("Genes",   f"{n_genes:,}")
         c2.metric("Samples", n_samples)
 
+        st.dataframe(
+            st.session_state[preview_key],
+            width='stretch',
+            hide_index=True,
+            column_config={
+                "Name": st.column_config.TextColumn("Name", pinned=True, width="small"),
+            },
+        )
+
+        st.caption(
+            f"Preview: {len(st.session_state[preview_key]):,}/{n_genes:,} rows. "
+            "Load the full matrix below to annotate, renormalize, or download it."
+        )
+
+        col_load, col_release = st.columns(2)
+
+        with col_load:
+            if df_key not in st.session_state:
+                if st.button("Load full matrix", key=f"load_{i}"):
+                    st.session_state[df_key] = pd.read_parquet(meta_entry["path"])
+                    st.rerun()
+        with col_release:
+            if df_key in st.session_state:
+                if st.button("Release from memory", key=f"release_{i}"):
+                    for k in (df_key, f"base_df_{i}", f"dl_bytes_{i}"):
+                        st.session_state.pop(k, None)
+                    gc.collect()
+                    st.rerun()
         
-        annotate_columns(i, st.session_state.char_df, gse_id, df_key)
+        if df_key not in st.session_state:
+            continue
+
+        df = st.session_state[df_key]
+
+        annotate_columns(i, st.session_state.char_df, gse_id, df_key, meta_entry["path"])
         
         with st.expander("Change Normalization", expanded=False):
             st.write(st.session_state["dp_text"])
@@ -1422,7 +1452,7 @@ if st.session_state.result_lists is not None:
             )
 
             st.write("Which columns would you like to apply it to?")
-            st.session_state["selected_columns"] = column_selector(df,i,gse_id)
+            st.session_state[f"selected_columns_{i}"] = column_selector(df,i,gse_id)
                 
             submit_button = st.button(label="Renormalize", key = f"renormalize_{i}")
 
@@ -1431,35 +1461,20 @@ if st.session_state.result_lists is not None:
                     st.session_state[df_key], 
                     st.session_state[f"norm_type_{i}"], 
                     st.session_state.selected_columns, 
-                    i
+                    i,
+                    meta_entry["path"]
                 )
                 df = st.session_state[df_key]
         
-        preview_columns = list(df.columns[:PREVIEW_COLUMNS])
-        preview_df = df.loc[:, preview_columns].head(PREVIEW_ROWS)
-        if len(df) > PREVIEW_ROWS or len(df.columns) > PREVIEW_COLUMNS:
-            st.caption(
-                "Showing a memory-safe preview of "
-                f"{len(preview_df):,}/{len(df):,} rows and "
-                f"{len(preview_columns):,}/{len(df.columns):,} columns. "
-                "The download contains the complete matrix."
+        if st.button("Prepare download", key = f"prep_dl_{i}"):
+            st.session_state[f"dl_bytes_{i}"] = dataframe_to_gzip_tsv(df)
+
+        if f"dl_bytes_{i}" in st.session_state:
+            norm_suffix = "_" + st.session_state[f"norm_type_{i}"] if st.session_state[f"norm_type_{i}"] != "none" else ""
+            st.download_button(
+                label="⬇ Download complete matrix (.txt.gz)",
+                key=f"download_{i}",
+                data=st.session_state[f"dl_bytes_{i}"],
+                file_name=f"{gse_id}_{original_normalization}{norm_suffix}.txt.gz",
+                mime="application/gzip",
             )
-
-        st.dataframe(
-            preview_df,
-            width='stretch',
-            hide_index=True,
-            column_config={
-                "Name": st.column_config.TextColumn("Name", pinned=True, width="small"),
-            },
-        )
-
-        tsv_gz = dataframe_to_gzip_tsv(df)
-        norm_suffix = "_" + st.session_state[f"norm_type_{i}"] if st.session_state[f"norm_type_{i}"] != "none" else ""
-        st.download_button(
-            label="⬇ Download complete matrix (.txt.gz)",
-            key = f"download_{i}",
-            data=tsv_gz,
-            file_name=f"{gse_id}_{original_normalization}{norm_suffix}.txt.gz",
-            mime="application/gzip",
-        )
