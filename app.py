@@ -226,8 +226,6 @@ else:
     selected_gpl = meta["gpl_ids"][0]
 st.session_state.selected_gpl = selected_gpl
 
-get_dp_and_char(st.session_state.selected_gpl)
-
 def needs_log(dp_text: str):
     yes_log = ["rma ", "(rma)", "lowess", "log", "vsn", "beadstudio","vsn","fhma","plier","quantile"]
     no_log = ["mas5", "mas 5"]
