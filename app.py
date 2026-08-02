@@ -60,6 +60,8 @@ if "run_pipeline" not in st.session_state:
     st.session_state.run_pipeline = False
 if "selected_columns" not in st.session_state:
     st.session_state.selected_columns = []
+if "selected_gpl" not in st.session_state:
+    st.session_state.selected_gpl = ""
 if "dp_text" not in st.session_state:
     st.session_state.dp_text = ""
 if "char_df" not in st.session_state:
@@ -210,7 +212,7 @@ if len(meta["gpl_ids"]) > 1:
     selected_gpl = st.selectbox(
         "Multiple platforms detected. Which platform would you like to use?",
         tuple(f"{meta['gpl_ids'][i]}:  {meta['gpl_titles'][i]}" for i in range(len(meta['gpl_ids']))),
-        index=None,
+        index=0,
         placeholder="Select GPL"
     )
     if selected_gpl:
@@ -222,6 +224,9 @@ if len(meta["gpl_ids"]) > 1:
         st.stop()
 else:
     selected_gpl = meta["gpl_ids"][0]
+st.session_state.selected_gpl = selected_gpl
+
+get_dp_and_char(st.session_state.selected_gpl)
 
 def needs_log(dp_text: str):
     yes_log = ["rma ", "(rma)", "lowess", "log", "vsn", "beadstudio","vsn","fhma","plier","quantile"]
@@ -313,7 +318,7 @@ def too_homogenous(col):
         result = re.split(r'(?<=\D)(?=\d)', str(c))
         results.append(result[0])
 
-    if len(list(set(results))) < 100:
+    if len(list(set(results))) < 30:
         return True
 
     col = list(set(col))
@@ -323,7 +328,7 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
     for gpl_name, gpl in getattr(gse, "gpls", {}).items():
         try:
             species = gpl.metadata.get('organism', [])[0]
-        except (AttributeError, TypeError, KeyError):
+        except (AttributeError, TypeError, KeyError, IndexError):
             return gpl_df, symbol_col
     
 
@@ -350,15 +355,21 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
     if numeric_namespace == None:
         return gpl_df, symbol_col
     else:
-        gpl_df["new_id_col"] = gpl_df[best_col].str.replace(r"_at$", "", regex=True)
+        gpl_df["new_id_col"] = gpl_df[best_col].astype(str).str.replace(r"_at$", "", regex=True)
         if (str(gpl_df[best_col].iloc[0]).strip()[:3].lower() == "eg:"):
-            gpl_df["new_id_col"] = gpl_df[best_col].str.split(':').str[1]
+            gpl_df["new_id_col"] = gpl_df[best_col].astype(str).str.split(':').str[1]
 
-        gp = GProfiler(return_dataframe=True)
-        results = gp.convert(organism=species,
-                    query=list(gpl_df["new_id_col"]),
-                    numeric_namespace=numeric_namespace,
-                    target_namespace=target_namespace)
+        try:
+            gp = GProfiler(return_dataframe=True)
+            results = gp.convert(organism=species, query=list(gpl_df["new_id_col"]),
+                                numeric_namespace=numeric_namespace, target_namespace=target_namespace)
+            if results.empty or "name" not in results.columns:
+                st.warning("Gene symbol conversion returned no results; keeping original IDs.")
+                return gpl_df, symbol_col
+        except Exception as e:
+            st.warning(f"Gene symbol conversion failed ({e}); keeping original IDs.")
+            return gpl_df, symbol_col
+        
         results_deduped = results.drop_duplicates(subset="incoming", keep="first")
         mapping = results_deduped.set_index("incoming")["name"]
         gpl_df["gene_symbol"] = gpl_df["new_id_col"].values 
@@ -366,16 +377,22 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
 
         return gpl_df, "gene_symbol"
         
-def get_gene_symbol_column(gse_id, counts_df, selected_gpl, probe_ids=None):
+def get_gene_symbol_column(counts_df, probe_ids=None):
     gse = GLOBAL_GSE
 
     gpl_df = None
+    print("WIEHFPOIWEMJFPOWEJMFLIWQJMF:WJ:FIWJ:OIFJIOWEJFPIOWEMFPOIWEQMFPIO")
+    print(getattr(gse, "gpls", {}).items())
     for gpl_name, gpl in getattr(gse, "gpls", {}).items():
-        if gpl_name == selected_gpl[0]:
+        if gpl_name == st.session_state.selected_gpl:
             gpl_df = gpl.table
             print(gpl_name)
-        #print(gpl.table)
-        #print(gpl_df.empty)
+            print(gpl.table)
+            print(gpl_df.empty)
+
+    if gpl_df is None:
+        st.error(f"Platform '{st.session_state.selected_gpl}' not found in this GEO series.")
+        raise ValueError(f"Platform '{st.session_state.selected_gpl}' not found in this GEO series; skipping gene symbol annotation.")
     
     if probe_ids is not None:
         index_set = {_normalize_id(v) for v in probe_ids}
@@ -404,6 +421,7 @@ def get_gene_symbol_column(gse_id, counts_df, selected_gpl, probe_ids=None):
             if too_homogenous(values):
                 continue
             col_score = values.apply(is_gene_symbol).mean()
+            print(f"  symbol candidate '{col}': {col_score:.3f}")
             if col_score > symbol_col_score:
                 symbol_col_score = col_score
                 symbol_col = col
@@ -603,8 +621,16 @@ def _scrape_geo_download_page(accession):
     page_url = f"https://www.ncbi.nlm.nih.gov/geo/download/?acc={accession}"
     print(f"  Scraping GEO download page: {page_url}")
  
-    r = requests.get(page_url, timeout=60)
-    r.raise_for_status()
+    try:
+        r = requests.get(page_url, timeout=60)
+        r.raise_for_status()
+    except requests.exceptions.Timeout:
+        st.error("GEO download page timed out. Try again in a moment.")
+        st.stop()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Could not reach GEO download page: {e}")
+        st.stop()
+
     soup = BeautifulSoup(r.text, "html.parser")
  
     seen = set()
@@ -656,19 +682,6 @@ def _scrape_geo_download_page(accession):
  
     print(f"{len(files)} candidates on download page")
     return files
-
-def select_download_urls(candidates, accession, norm_type):
-    submitter_candidates = []
-    for c in candidates:
-        if c.ncbi_data and "raw" in c.filename.lower():
-            return [c], "raw_counts"
-        if not c.ncbi_data:
-            submitter_candidates.append(c)
-    if submitter_candidates:
-        return [submitter_candidates[0]], norm_type
-    if candidates:
-        return [candidates[0]], candidates[0].normalization
-    return [], norm_type
 
 #constructing the dataframe
 
@@ -810,7 +823,10 @@ def _annotate_counts(accession, selected, counts_df, selected_gpl):
     if selected[0].ncbi_data:
         annot_url = "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts&file=Human.GRCh38.p13.annot.tsv.gz"
         url_bytes = _download_all([annot_url])
-        raw = url_bytes[annot_url]
+        raw = url_bytes.get(annot_url)
+        if raw is None:
+            st.warning("Annotation file too large or failed to download; skipping gene symbol mapping.")
+            return counts_df
         filename = annot_url.split("file=")[-1]
 
         if filename.endswith(".gz"):
@@ -826,8 +842,8 @@ def _annotate_counts(accession, selected, counts_df, selected_gpl):
         symbol_col = "Symbol"
     else:
         try:
-            annot_df, id_col, symbol_col = get_gene_symbol_column(accession, counts_df, selected_gpl)
-        except:
+            annot_df, id_col, symbol_col = get_gene_symbol_column(counts_df)
+        except ValueError as e:
             return counts_df
 
     mapping     = dict(zip(annot_df[id_col].astype(str), annot_df[symbol_col].astype(str)))
@@ -936,7 +952,7 @@ def fetch_and_normalize(
 def fetch_rnaseq_matrix(gse_id: str, meta):
     try:
         results = fetch_and_normalize(
-            selected_gpl=meta["gpl_ids"],
+            selected_gpl=st.session_state.selected_gpl,
             accession=gse_id,
             geo_cache_dir="./geo_cache",
             save_output=False,
@@ -1000,9 +1016,16 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
 
     NULL_VALUES = {"---", "na", "", "null", "nan"}
 
-    gpl_table, matching_col, symbol_col = get_gene_symbol_column(
-        gse_id, df, meta["gpl_ids"], probe_ids=df["_probe_id"]
-    )
+    try:
+        gpl_table, matching_col, symbol_col = get_gene_symbol_column(
+            df, probe_ids=df["_probe_id"]
+        )
+    except ValueError as e:
+        st.warning(f"{e} Keeping original probe IDs.")
+        df.insert(0, "Name", df["_probe_id"])
+        df = df.drop("_probe_id", axis=1)
+        return df
+    
     print(f"  → matching_col='{matching_col}'  symbol_col='{symbol_col}'")
 
     master_mapping: dict[str, str] = {}
@@ -1072,6 +1095,7 @@ def survival_metadata_ui(char_df):
         st.session_state.survival_df["GSM"] = char_df.index
 
     with st.expander("Generate Survival Metadata File"):
+        st.write("Preview of characteristics data (taken from NCBI GEO)")
         st.dataframe(
             char_df.head(),
             width='stretch',
@@ -1132,6 +1156,42 @@ def survival_metadata_ui(char_df):
             mime="text/plain",
         )
 
+@st.fragment
+def annotate_columns(i, char_df, gse_id, df_key):
+    with st.expander("Annotate Columns", expanded=False):
+        st.write("Replace GSM column names with sample data")
+
+        st.pills("Annotate by:", char_df.columns, selection_mode="multi", key=f"pill_selector_{i}")
+
+        current_selection = st.session_state.get(f"pill_selector_{i}") or []
+        if current_selection:
+            example_name = "_".join([str(char_df[x].iloc[0]) for x in current_selection])
+            st.write(f"Example sample name: {example_name}_{char_df.index[0]}")
+        else:
+            st.write(char_df.index[0])
+
+        if st.button("Annotate Columns", key=f"annotate_columns_{i}"):
+            column_mapping = {}
+            if not current_selection:
+                for gsm in char_df.index:
+                    column_mapping[gsm] = str(gsm)
+            else:
+                for gsm in char_df.index:
+                    column_mapping[gsm] = "_".join([str(char_df[x].loc[gsm]) for x in current_selection]) + f"_{gsm}"
+
+            base_df = st.session_state[f"base_df_{i}"].copy()
+
+            current_norm = st.session_state.get(f"norm_type_{i}", "none")
+            if current_norm != "none":
+                base_df = apply_norm(base_df, current_norm, st.session_state.get("selected_columns", list(base_df.columns)), i)
+
+            st.session_state[df_key] = base_df.rename(columns=column_mapping)
+
+            st.session_state[f"selected_cols_dict_{gse_id}_{i}"] = {col: True for col in list(column_mapping.values())}
+            st.session_state[f"selected_cols_dict_{gse_id}_{i}"]["Name"] = True
+            st.rerun(scope="app")
+
+@st.fragment
 def column_selector(counts_df, i, gse_id):
     state_key = f"selected_cols_dict_{gse_id}_{i}"
     if state_key not in st.session_state:
@@ -1343,40 +1403,8 @@ if st.session_state.result_lists is not None:
         c1.metric("Genes",   f"{n_genes:,}")
         c2.metric("Samples", n_samples)
 
-        with st.expander("Annotate Columns", expanded = False):
-            char_df = st.session_state.char_df
-            #print(char_df)
-            st.write("Replace GSM column names with sample data")
-            
-            st.pills("Annotate by:", char_df.columns, selection_mode="multi", key = f"pill_selector_{i}")
-            #print(st.session_state[f"pill_selector_{i}"])
-            current_selection = st.session_state.get(f"pill_selector_{i}") or []
-            if current_selection:
-                example_name = "_".join([str(char_df[x].iloc[0]) for x in st.session_state[f"pill_selector_{i}"]])
-                st.write(f"Example sample name: {example_name}_{char_df.index[0]}")
-            else:
-                st.write(char_df.index[0])
-            if st.button("Annotate Columns", key = f"annotate_columns_{i}"):
-                column_mapping = {}
-                if not current_selection:
-                    for gsm in char_df.index:
-                        column_mapping[gsm] = str(gsm)
-                else:
-                    for gsm in char_df.index:
-                        column_mapping[gsm] = "_".join([str(char_df[x].loc[gsm]) for x in current_selection]) + f"_{gsm}"
-                
-                base_df = st.session_state[f"base_df_{i}"].copy()
-                
-                current_norm = st.session_state.get(f"norm_type_{i}", "none")
-                if current_norm != "none":
-                    base_df = apply_norm(base_df, current_norm, st.session_state.get("selected_columns", list(base_df.columns)), i)
-                    
-                
-                st.session_state[df_key] = base_df.rename(columns=column_mapping)
-
-                st.session_state[f"selected_cols_dict_{gse_id}_{i}"] = {col: True for col in list(column_mapping.values())}
-                st.session_state[f"selected_cols_dict_{gse_id}_{i}"]["Name"] = True
-                st.rerun()
+        
+        annotate_columns(i, st.session_state.char_df, gse_id, df_key)
         
         with st.expander("Change Normalization", expanded=False):
             st.write(st.session_state["dp_text"])
