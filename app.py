@@ -1180,7 +1180,7 @@ def annotate_columns(i, char_df, gse_id, df_key, source_path):
 
             current_norm = st.session_state.get(f"norm_type_{i}", "none")
             if current_norm != "none":
-                base_df = apply_norm(base_df, current_norm, st.session_state.get(f"selected_columns_{i}", list(base_df.columns)), i, meta_entry["path"])
+                base_df = apply_norm(base_df, current_norm, st.session_state.get(f"selected_columns_{i}", list(base_df.columns)), i, source_path)
 
             st.session_state[df_key] = base_df.rename(columns=column_mapping)
 
@@ -1373,7 +1373,7 @@ if st.session_state.result_lists is not None:
     for i, meta_entry in enumerate(result_lists):
         if f"norm_type_{i}" not in st.session_state:
             st.session_state[f"norm_type_{i}"] = "none"
-        
+
         df_key = f"df_{i}"
         preview_key = f"preview_{i}"
 
@@ -1384,57 +1384,47 @@ if st.session_state.result_lists is not None:
         n_genes = meta_entry["n_genes"]
         n_samples = meta_entry["n_samples"]
 
-        st.markdown(body = "<hr>", unsafe_allow_html= True)
+        st.markdown(body="<hr>", unsafe_allow_html=True)
         st.caption(f"**{meta_entry['filename']}**")
         c4, c5 = st.columns(2)
-        
-        
         with c4:
-            st.markdown(body=f'<div class = "container"><p class = "normalization">Original Normalization</p> <p class = "normtext">{original_normalization}</p></div>', unsafe_allow_html = True)
-
+            st.markdown(body=f'<div class="container"><p class="normalization">Original Normalization</p> <p class="normtext">{original_normalization}</p></div>', unsafe_allow_html=True)
         with c5:
-            st.markdown(body=f'<div class = "container"><p class = "normalization">Applied Normalization</p> <p class = "normtext">{st.session_state[f"norm_type_{i}"].upper()}</p></div>', unsafe_allow_html = True)
+            st.markdown(body=f'<div class="container"><p class="normalization">Applied Normalization</p> <p class="normtext">{st.session_state[f"norm_type_{i}"].upper()}</p></div>', unsafe_allow_html=True)
 
         c1, c2, c3 = st.columns(3)
-        c1.metric("Genes",   f"{n_genes:,}")
+        c1.metric("Genes", f"{n_genes:,}")
         c2.metric("Samples", n_samples)
 
-        st.dataframe(
-            st.session_state[preview_key],
-            width='stretch',
-            hide_index=True,
-            column_config={
-                "Name": st.column_config.TextColumn("Name", pinned=True, width="small"),
-            },
-        )
-
-        st.caption(
-            f"Preview: {len(st.session_state[preview_key]):,}/{n_genes:,} rows. "
-            "Load the full matrix below to annotate, renormalize, or download it."
-        )
-
         col_load, col_release = st.columns(2)
-
         with col_load:
             if df_key not in st.session_state:
                 if st.button("Load full matrix", key=f"load_{i}"):
                     st.session_state[df_key] = pd.read_parquet(meta_entry["path"])
+                    st.session_state.pop(preview_key, None)  # superseded by the live view below
                     st.rerun()
         with col_release:
             if df_key in st.session_state:
                 if st.button("Release from memory", key=f"release_{i}"):
-                    for k in (df_key, f"base_df_{i}", f"dl_bytes_{i}"):
+                    for k in (df_key, f"dl_bytes_{i}"):
                         st.session_state.pop(k, None)
                     gc.collect()
                     st.rerun()
-        
+
         if df_key not in st.session_state:
+            st.dataframe(
+                st.session_state[preview_key],
+                width='stretch',
+                hide_index=True,
+                column_config={"Name": st.column_config.TextColumn("Name", pinned=True, width="small")},
+            )
+            st.caption(f"Preview: {len(st.session_state[preview_key]):,}/{n_genes:,} rows. Load the full matrix to annotate, renormalize, or download it.")
             continue
 
         df = st.session_state[df_key]
 
         annotate_columns(i, st.session_state.char_df, gse_id, df_key, meta_entry["path"])
-        
+
         with st.expander("Change Normalization", expanded=False):
             st.write(st.session_state["dp_text"])
             is_log, summ_norm = needs_log(original_normalization)
@@ -1447,27 +1437,42 @@ if st.session_state.result_lists is not None:
                 norm_suggestion = f"log2 because {summ_norm} is linearly scaled, potentially leading to a skewed distribution."
 
             st.radio(
-                label = f"Suggestion: {norm_suggestion}",
-                options = ("none", "log2", "log10", "cpm", "log2(cpm+1)", "log10(cpm+1)"),
-                key = f"norm_type_{i}"
+                label=f"Suggestion: {norm_suggestion}",
+                options=("none", "log2", "log10", "cpm", "log2(cpm+1)", "log10(cpm+1)"),
+                key=f"norm_type_{i}"
             )
 
             st.write("Which columns would you like to apply it to?")
-            st.session_state[f"selected_columns_{i}"] = column_selector(df,i,gse_id)
-                
-            submit_button = st.button(label="Renormalize", key = f"renormalize_{i}")
+            st.session_state[f"selected_columns_{i}"] = column_selector(df, i, gse_id)
+
+            submit_button = st.button(label="Renormalize", key=f"renormalize_{i}")
 
             if submit_button:
                 st.session_state[df_key] = apply_norm(
-                    st.session_state[df_key], 
-                    st.session_state[f"norm_type_{i}"], 
-                    st.session_state.selected_columns, 
+                    st.session_state[df_key],
+                    st.session_state[f"norm_type_{i}"],
+                    st.session_state[f"selected_columns_{i}"],  # fixed
                     i,
                     meta_entry["path"]
                 )
+                st.session_state.pop(f"dl_bytes_{i}", None)  # stale bytes, force rebuild
                 df = st.session_state[df_key]
-        
-        if st.button("Prepare download", key = f"prep_dl_{i}"):
+
+        # Live view of the CURRENT df_key — reflects annotate/renormalize immediately
+        preview_cols = list(df.columns[:PREVIEW_COLUMNS])
+        st.dataframe(
+            df.loc[:, preview_cols].head(PREVIEW_ROWS),
+            width='stretch',
+            hide_index=True,
+            column_config={"Name": st.column_config.TextColumn("Name", pinned=True, width="small")},
+        )
+        if len(df) > PREVIEW_ROWS or len(df.columns) > PREVIEW_COLUMNS:
+            st.caption(
+                f"Showing {min(len(df), PREVIEW_ROWS):,}/{len(df):,} rows and "
+                f"{len(preview_cols):,}/{len(df.columns):,} columns. The download contains the complete matrix."
+            )
+
+        if st.button("Prepare download", key=f"prep_dl_{i}"):
             st.session_state[f"dl_bytes_{i}"] = dataframe_to_gzip_tsv(df)
 
         if f"dl_bytes_{i}" in st.session_state:
