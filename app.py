@@ -1181,8 +1181,15 @@ def annotate_columns(i, char_df, gse_id, df_key, source_path):
             current_norm = st.session_state.get(f"norm_type_{i}", "none")
             if current_norm != "none":
                 base_df = apply_norm(base_df, current_norm, st.session_state.get(f"selected_columns_{i}", list(base_df.columns)), i, source_path)
+            
+            new_column_mapping = column_mapping.copy()
+            for col in base_df.columns.tolist():
+                for k in column_mapping.keys():
+                    if k in col:
+                        new_column_mapping[col] = column_mapping[k]
 
-            st.session_state[df_key] = base_df.rename(columns=column_mapping)
+
+            st.session_state[df_key] = base_df.rename(columns=new_column_mapping)
 
             st.session_state[f"selected_cols_dict_{gse_id}_{i}"] = {col: True for col in list(column_mapping.values())}
             st.session_state[f"selected_cols_dict_{gse_id}_{i}"]["Name"] = True
@@ -1399,10 +1406,18 @@ if st.session_state.result_lists is not None:
         col_load, col_release = st.columns(2)
         with col_load:
             if df_key not in st.session_state:
-                if st.button("Load full matrix", key=f"load_{i}"):
-                    st.session_state[df_key] = pd.read_parquet(meta_entry["path"])
-                    st.session_state.pop(preview_key, None)  # superseded by the live view below
-                    st.rerun()
+                col_info, col_button = st.columns([0.2, 0.9])
+                with col_info:
+                    with st.popover(label = ":material/info:"):
+                        st.write(
+                            "The full matrix is not loaded in memory yet. "
+                            "Click the button below to load it for annotation, renormalization, or download."
+                        )
+                with col_button:
+                    if st.button("Load full matrix", key=f"load_{i}"):
+                        st.session_state[df_key] = pd.read_parquet(meta_entry["path"])
+                        st.session_state.pop(preview_key, None)  # superseded by the live view below
+                        st.rerun()
         with col_release:
             if df_key in st.session_state:
                 if st.button("Release from memory", key=f"release_{i}"):
