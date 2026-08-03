@@ -1420,11 +1420,16 @@ if st.session_state.result_lists is not None:
                         st.rerun()
         with col_release:
             if df_key in st.session_state:
-                if st.button("Release from memory", key=f"release_{i}"):
-                    for k in (df_key, f"dl_bytes_{i}"):
-                        st.session_state.pop(k, None)
-                    gc.collect()
-                    st.rerun()
+                col_info, col_button = st.columns([0.2, 0.9])
+                with col_info:
+                    with st.popover(":material/info:"):
+                        st.write("Allows you to annotate, normalize, or download other dataframes while saving the changes you have made to this one. You can have a maximum of 2 dataframes loaded at once. Release one of them to view more.")
+                with col_button:
+                    if st.button("Release from memory", key=f"release_{i}"):
+                        for k in (df_key, f"dl_bytes_{i}"):
+                            st.session_state.pop(k, None)
+                        gc.collect()
+                        st.rerun()
 
         if df_key not in st.session_state:
             st.dataframe(
