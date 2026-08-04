@@ -215,7 +215,6 @@ if not meta.get("gsm_ids") or not meta.get("gpl_ids"):
     st.error("The GEO record does not contain usable sample or platform metadata.")
     st.stop()
 
-get_dp_and_char(GLOBAL_GSE, meta)
 
 st.subheader(meta["title"])
 st.caption(
@@ -241,6 +240,8 @@ if len(meta["gpl_ids"]) > 1:
 else:
     selected_gpl = meta["gpl_ids"][0]
 st.session_state.selected_gpl = selected_gpl
+
+get_dp_and_char(GLOBAL_GSE, meta)
 
 def needs_log(dp_text: str):
     yes_log = ["rma ", "(rma)", "lowess", "log", "vsn", "beadstudio","vsn","fhma","plier","quantile"]
@@ -356,7 +357,6 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
     target_namespace = "HGNC" if species == "hsapiens" else "MGI"
 
     id = str(gpl_df[best_col].iloc[0])
-    print(id.strip()[:3].lower() == "eg:")
     numeric_namespace = None
     if (bool(re.match(r"^\d+(_at)?$", id))):
         numeric_namespace = "ENTREZGENE_ACC"
@@ -395,14 +395,10 @@ def get_gene_symbol_column(counts_df, probe_ids=None):
     gse = GLOBAL_GSE
 
     gpl_df = None
-    print("WIEHFPOIWEMJFPOWEJMFLIWQJMF:WJ:FIWJ:OIFJIOWEJFPIOWEMFPOIWEQMFPIO")
-    print(getattr(gse, "gpls", {}).items())
+
     for gpl_name, gpl in getattr(gse, "gpls", {}).items():
         if gpl_name == st.session_state.selected_gpl:
             gpl_df = gpl.table
-            print(gpl_name)
-            print(gpl.table)
-            print(gpl_df.empty)
 
     if gpl_df is None:
         st.error(f"Platform '{st.session_state.selected_gpl}' not found in this GEO series.")
@@ -1084,14 +1080,14 @@ def dataframe_to_gzip_tsv(df: pd.DataFrame) -> bytes:
 @st.fragment
 def survival_metadata_ui(char_df):
     if char_df.empty or not len(char_df.columns):
-        st.info("No sample characteristics are available for survival metadata.")
+        st.info("No sample characteristics are available for time-to-event data.")
         return
 
     if "survival_df" not in st.session_state:
         st.session_state.survival_df = pd.DataFrame(index=char_df.index)
         st.session_state.survival_df["GSM"] = char_df.index
 
-    with st.expander("Generate Survival Metadata File"):
+    with st.expander("Generate Time-to-Event Data"):
         st.write("Preview of characteristics data (taken from NCBI GEO)")
         st.dataframe(
             char_df.head(),
@@ -1099,7 +1095,7 @@ def survival_metadata_ui(char_df):
             hide_index=True,
         )
         mortality = st.selectbox(
-            "Mortality column",
+            "Event column",
             options=list(char_df.columns),
             key="survival_mortality_col"
         )
@@ -1112,14 +1108,14 @@ def survival_metadata_ui(char_df):
             mapping = {}
             for i in unique_vals:
                 mapping[i] = st.radio(
-                    label=f"Label '{i}' as alive (0) or dead (1)",
+                    label=f"Label '{i}' as no event (0) or event (1)",
                     options=(0, 1),
                     key=f"alive_dead_{i}"
                 )
             st.session_state.survival_df["death"] = char_df[mortality].map(mapping)
 
         t_mortality = st.selectbox(
-            "Time to mortality column",
+            "Time to event column",
             options=list(char_df.columns),
             key="survival_time_col"
         )
@@ -1137,7 +1133,7 @@ def survival_metadata_ui(char_df):
 
         st.session_state.survival_df[time_units] = char_df[t_mortality]
 
-        st.write("Final survival metadata file: ")
+        st.write("Final time-to-event data: ")
 
         st.dataframe(
             st.session_state.survival_df.head(),
