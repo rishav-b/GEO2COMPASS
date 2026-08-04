@@ -1411,7 +1411,7 @@ if st.session_state.result_lists is not None:
                     with st.popover(label = ":material/info:"):
                         st.write(
                             "The full matrix is not loaded in memory yet. "
-                            "Click the button below to load it for annotation, renormalization, or download."
+                            "Click the button 'Load full matrix' to load it for annotation, renormalization, or download."
                         )
                 with col_button:
                     if st.button("Load full matrix", key=f"load_{i}"):
@@ -1423,7 +1423,7 @@ if st.session_state.result_lists is not None:
                 col_info, col_button = st.columns([0.2, 0.9])
                 with col_info:
                     with st.popover(":material/info:"):
-                        st.write("Allows you to annotate, normalize, or download other dataframes while saving the changes you have made to this one. You can have a maximum of 2 dataframes loaded at once. Release one of them to view more.")
+                        st.write("Allows you to annotate, normalize, or download other matrices while saving the changes you have made to this one. You can have a maximum of 2 matrices loaded at once. Release one of them to view more.")
                 with col_button:
                     if st.button("Release from memory", key=f"release_{i}"):
                         for k in (df_key, f"dl_bytes_{i}"):
@@ -1480,12 +1480,7 @@ if st.session_state.result_lists is not None:
 
         # Live view of the CURRENT df_key — reflects annotate/renormalize immediately
         preview_cols = list(df.columns[:PREVIEW_COLUMNS])
-        st.dataframe(
-            df.loc[:, preview_cols].head(PREVIEW_ROWS),
-            width='stretch',
-            hide_index=True,
-            column_config={"Name": st.column_config.TextColumn("Name", pinned=True, width="small")},
-        )
+
         if len(df) > PREVIEW_ROWS or len(df.columns) > PREVIEW_COLUMNS:
             st.caption(
                 f"Showing {min(len(df), PREVIEW_ROWS):,}/{len(df):,} rows and "
@@ -1504,3 +1499,10 @@ if st.session_state.result_lists is not None:
                 file_name=f"{gse_id}_{original_normalization}{norm_suffix}.txt.gz",
                 mime="application/gzip",
             )
+
+        st.dataframe(
+            df.loc[:, preview_cols].head(PREVIEW_ROWS),
+            width='stretch',
+            hide_index=True,
+            column_config={"Name": st.column_config.TextColumn("Name", pinned=True, width="small")},
+        )
