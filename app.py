@@ -11,16 +11,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urljoin
+from urllib.request import Request, urlopen
+import subprocess
 
 # PyArrow 25.0.0 can segfault when Streamlit initializes Arrow from a
 # ScriptRunner thread. Use the system allocator even if the deployment
 # environment does not define this variable .
 os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
 
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.types as pt
+import pyarrow.dataset as ds
 import GEOparse
 import numpy as np
 import pandas as pd
 import requests
+import pyarrow.parquet as pq
 import streamlit as st
 from bs4 import BeautifulSoup
 from gprofiler import GProfiler
@@ -28,17 +35,12 @@ from gprofiler import GProfiler
 st.set_page_config(page_title="GEO-2-COMPASS")
 st.title("GEO-2-COMPASS")
 
-MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
-MAX_MATRIX_CELLS = 20_000_000
-MAX_LOADED = 2
+MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
+MAX_MATRIX_CELLS = 50_000_000
 PREVIEW_ROWS = 1_000
-PREVIEW_COLUMNS = 50
+PREVIEW_COLUMNS = 150
 
 loaded_keys = [k for k in st.session_state.keys() if k.startswith("df_")]
-if len(loaded_keys) >= MAX_LOADED:
-    oldest = loaded_keys[0]  # or track load order explicitly
-    for k in (oldest, oldest.replace("df_", "dl_bytes_")):
-        st.session_state.pop(k, None)
 
 with st.form("geo_accession_form"):
     requested_gse_id = st.text_input(
@@ -121,6 +123,7 @@ def fetch_metadata(gse_id: str, gse) -> dict:
 
         return {
             "title":      gse.metadata.get('title', [gse_id])[0],
+            "gse_id": gse_id,
             "type":       study_type,
             "gsm_ids":    gsm_list,
             "gpl_ids":    gpl_ids,
@@ -276,45 +279,41 @@ def reduce_matrix_memory(df: pd.DataFrame) -> pd.DataFrame:
 # GENE SYMBOL ANNOTATION  # # # 
 # # # # # # # # # # # # # # # #
 
-REJECT_PATTERNS = [
-    re.compile(r'^(NM|NR|NP|XM|XR|XP|NG|NT|NC)_\d+(\.\d+)?$'),  
-    re.compile(r'^AFFX-.*_at$'),
-    re.compile(r'^.*_at$$'),
-    re.compile(r'^[A-Z]{1,2}\d{6,}(\.\d+)?$'),
-    re.compile(r'^GenMAPP'),                   
-    re.compile(r'^ILMN_\d+$'),                                     
-    re.compile(r'^ENSG\d+|^ENST\d+|^ENSMUSG\d+|^ENSMUST\d+|^ENSP\d+'),                  
-    re.compile(r'^\d+(_[a-z]_at|_at|_x_at|_s_at)$'),             
-    re.compile(r'^A_\d+_P\d+$'),                                   
-    re.compile(r'^chr', re.IGNORECASE),                        
-    re.compile(r'^\d+[pq]\d+'),                               
-    re.compile(r'^GO:\d+$'),                                 
-    re.compile(r'\.\d+$'),                                   
-    re.compile(r'^\d'),
-    re.compile(r'\s'),
-    re.compile(r'\.'),                                   
-    re.compile(r'_\d{4,}'),
-    re.compile(r'scl\d+.'),
-    re.compile(r'RefSeq'),
-    re.compile(r'\+'),
-    re.compile(r'^[agctAGCT]*$'),
-    re.compile(r"^.{,3}$")                                       
-]
+_REJECT_COMBINED = re.compile(
+    r"^(?:NM|NR|NP|XM|XR|XP|NG|NT|NC)_\d+(?:\.\d+)?$|"
+    r"^AFFX-.*_at$|"
+    r"^.*_at$|"
+    r"^[A-Z]{1,2}\d{6,}(?:\.\d+)?$|"
+    r"^GenMAPP|"
+    r"^ILMN_\d+$|"
+    r"^(?:ENSG|ENST|ENSMUSG|ENSMUST|ENSP)\d+|"
+    r"^\d+_(?:[a-z]_at|at|x_at|s_at)$|"
+    r"^A_\d+_P\d+$|"
+    r"^chr|"
+    r"^\d+[pq]\d+|"
+    r"^GO:\d+$|"
+    r"\.\d+$|"
+    r"^\d|\s|\.|_\d{4,}|scl\d+\.|RefSeq|\+|"
+    r"^[agctAGCT]*$|"
+    r"^.{0,3}$",
+    re.IGNORECASE,
+)
 
-ACCEPT_PATTERNS = [
-    re.compile(r'^\d{7}[A-Za-z]\d{2}[Rr][Ii][Kk]$'),  
-]
+_ACCEPT_COMBINED = re.compile(r"^\d{7}[A-Za-z]\d{2}[Rr][Ii][Kk]$")
+
 
 def is_gene_symbol(value):
-    if "//" in str(value):
-        value = str(value).split("//")
-        v = value[1]
-        v = str(v).strip()
-        return (not any(p.search(v) for p in REJECT_PATTERNS)) or any(r.search(v) for r in ACCEPT_PATTERNS)
-
+    s_val = str(value)
+    if "//" in s_val:
+        parts = s_val.split("//")
+        v = parts[1].strip() if len(parts) > 1 else parts[0].strip()
     else:
-        v = str(value).strip()
-        return (not any(p.search(v) for p in REJECT_PATTERNS)) or any(r.search(v) for r in ACCEPT_PATTERNS)
+        v = s_val.strip()
+
+    if _REJECT_COMBINED.search(v):
+        return bool(_ACCEPT_COMBINED.search(v))
+    
+    return True
     
 def too_homogenous(col):
     if len(col) <= 0:
@@ -391,18 +390,21 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
 
         return gpl_df, "gene_symbol"
         
-def get_gene_symbol_column(counts_df, probe_ids=None):
+def get_gene_symbol_column(counts_df, selected_gpl = None, probe_ids=None):
     gse = GLOBAL_GSE
+
+    if not selected_gpl:
+        selected_gpl = st.session_state.selected_gpl
 
     gpl_df = None
 
     for gpl_name, gpl in getattr(gse, "gpls", {}).items():
-        if gpl_name == st.session_state.selected_gpl:
+        if gpl_name == selected_gpl:
             gpl_df = gpl.table
 
     if gpl_df is None:
-        st.error(f"Platform '{st.session_state.selected_gpl}' not found in this GEO series.")
-        raise ValueError(f"Platform '{st.session_state.selected_gpl}' not found in this GEO series; skipping gene symbol annotation.")
+        st.error(f"Platform '{selected_gpl}' not found in this GEO series.")
+        raise ValueError(f"Platform '{selected_gpl}' not found in this GEO series; skipping gene symbol annotation.")
     
     if probe_ids is not None:
         index_set = {_normalize_id(v) for v in probe_ids}
@@ -561,43 +563,56 @@ def classify_normalization(dp_text: str) -> str:
         print("No clear normalization found.")
     return norm_type
 
-#bytes download
-
 def _download_bytes(url: str) -> Optional[bytes]:
-    url = url.replace("ftp://", "https://", 1)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; GEO-2-COMPASS/1.0; contact: your_email@example.com)"
-    }
-    with requests.get(
-        url,
-        stream=True,
-        timeout=(30, 300),
-        headers=headers,
-    ) as resp:
-        resp.raise_for_status()
+    """Downloads a file using aria2c CLI and returns its raw bytes."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        filename = url.split("/")[-1]
+        # Handle query parameter style URLs (e.g., ...file=GSE123_raw.tsv.gz)
+        if "file=" in filename:
+            filename = filename.split("file=")[-1].split("&")[0]
 
-        file_size = int(resp.headers.get("Content-Length", 0))
-        if file_size > MAX_DOWNLOAD_BYTES:
+        cmd = [
+            "aria2c",
+            "-x", "16",
+            "-s", "16",
+            "-j", "1",
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "--dir", temp_dir,
+            "-o", filename,
+            "--quiet=true",
+            url,
+        ]
+
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"    ✗ aria2c failed for {filename}")
             return None
 
-        payload = bytearray()
-        for chunk in resp.iter_content(chunk_size=1024 * 1024):
-            if not chunk:
-                continue
-            payload.extend(chunk)
-            if len(payload) > MAX_DOWNLOAD_BYTES:
-                return None
+        file_path = os.path.join(temp_dir, filename)
 
-        return bytes(payload)
+        if not os.path.exists(file_path):
+            return None
+
+        file_size = os.path.getsize(file_path)
+        if file_size > MAX_DOWNLOAD_BYTES:
+            print(f"    ✗ File exceeded size limit ({file_size / 1e6:.1f} MB)")
+            return None
+
+        with open(file_path, "rb") as f:
+            return f.read()
+
 
 def _download_all(urls: list[str]) -> dict[str, Optional[bytes]]:
     results: dict[str, Optional[bytes]] = {}
     if not urls:
         return results
-    print(f"  Downloading {len(urls)} file(s) in parallel…")
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(4, len(urls)),
-    ) as ex:
+
+    print(f"  Downloading {len(urls)} file(s) using aria2c…")
+
+    # Limit workers so we don't spam open thousands of connections simultaneously
+    workers = min(2, len(urls))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         fut_to_url = {ex.submit(_download_bytes, u): u for u in urls}
         for fut in concurrent.futures.as_completed(fut_to_url):
             url = fut_to_url[fut]
@@ -606,11 +621,12 @@ def _download_all(urls: list[str]) -> dict[str, Optional[bytes]]:
                 res = fut.result()
                 results[url] = res
                 if res is not None:
-                    print(f"    ✓ {fname} ({len(results[url]) / 1e6:.1f} MB)")
+                    print(f"    ✓ {fname} ({len(res) / 1e6:.1f} MB)")
                 else:
-                    print(f" {fname}: Exceeded size limit, returned None")
+                    print(f"    ✗ {fname}: Failed or exceeded size limit")
             except Exception as e:
                 print(f"    ✗ {fname}: {e}")
+
     return results
 
 #simple helper functions
@@ -790,7 +806,7 @@ def _build_matrix_from_flat_files(url_bytes, file_meta):
             else:
                 df = pd.read_csv(
                     io.BytesIO(raw), sep=_detect_sep(filename),
-                    index_col=0, engine="python", on_bad_lines="skip",
+                    index_col=0, on_bad_lines="skip",
                 )
             
 
@@ -850,15 +866,14 @@ def _annotate_counts(accession, selected, counts_df, selected_gpl):
             filename = filename[:-3]
 
         annot_df = pd.read_csv(
-            io.BytesIO(raw), sep=_detect_sep(filename),
-            engine="python", on_bad_lines="skip",
+            io.BytesIO(raw), sep=_detect_sep(filename), on_bad_lines="skip",
         )
         
         id_col = "GeneID"
         symbol_col = "Symbol"
     else:
         try:
-            annot_df, id_col, symbol_col = get_gene_symbol_column(counts_df)
+            annot_df, id_col, symbol_col = get_gene_symbol_column(counts_df, selected_gpl = selected_gpl)
         except ValueError as e:
             return counts_df
 
@@ -911,31 +926,30 @@ def fetch_and_normalize(
 
     results_meta = []
 
-    # Process one matrix per run. The previous implementation retained every
-    # raw/FPKM/TPM candidate simultaneously and could exceed Railway memory.
-    for c in candidates:
+    url_bytes = _download_all([c.url for c in candidates])
+    
+    def process_candidate(c):
         selected = [c]
         if c.normalization == "unknown":
             c.normalization = inferred_norm
 
         print(f"\n  Processing: {c.filename}")
 
-        url_bytes = _download_all([c.url])
         if url_bytes.get(c.url) is None:
             print(f"    Exceeded file size, skipping {c.url}")
-            continue
+            return None
 
         counts_df = _fetch_counts_df(accession, selected, url_bytes)
-        del url_bytes
+
         gc.collect()
 
         if counts_df.empty:
-            continue
+            return None
 
         if counts_df.size > MAX_MATRIX_CELLS:
             print(f"    Skipping {c.filename}: {counts_df.size:,} cells exceeds "
                   f"{MAX_MATRIX_CELLS:,}-cell limit")
-            continue
+            return None
 
         counts_df = _annotate_counts(accession, selected, counts_df, selected_gpl)
         counts_df = reduce_matrix_memory(counts_df)
@@ -951,10 +965,13 @@ def fetch_and_normalize(
         counts_df.reset_index(drop=True, inplace=True)
 
         cache_path = geo_cache_dir / f"{accession}_{c.filename}_{id(c)}.parquet"
+        modified_path = geo_cache_dir / f"{accession}_{c.filename}_{id(c)}_modified.parquet"
         counts_df.to_parquet(cache_path, compression="gzip")
+        counts_df.to_parquet(modified_path, compression = "gzip")
 
         results_meta.append({
             "path": cache_path,
+            "modified_path": modified_path,
             "filename": c.filename,
             "normalization_type": c.normalization,
             "n_genes": counts_df.shape[0],
@@ -962,7 +979,22 @@ def fetch_and_normalize(
         })
 
         del counts_df
-        gc.collect()
+    
+
+    max_workers = min(4, len(candidates))
+
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+
+        futures = [executor.submit(process_candidate, c) for c in candidates]
+        
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res is not None:
+                results_meta.append(res)
+    
+    gc.collect()
+    del url_bytes
 
     return results_meta
 
@@ -1032,6 +1064,8 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
     print(f"Remapped using '{matching_col}' → '{symbol_col}'")
     return df
 
+
+
 def fetch_microarray_matrix(meta: dict):
     dp_text = st.session_state["dp_text"]
     summ_norm = "unknown"
@@ -1040,6 +1074,7 @@ def fetch_microarray_matrix(meta: dict):
         is_log, summ_norm = needs_log(dp_text)
 
     final_df = GLOBAL_GSE.pivot_samples(values="VALUE")[meta["gsm_ids"]]
+    
     print(f"Microarray matrix contains {len(final_df.columns)} samples.")
     final_df = _annotate_matrix(final_df)
     final_df = reduce_matrix_memory(final_df)
@@ -1047,10 +1082,14 @@ def fetch_microarray_matrix(meta: dict):
     geo_cache_dir = Path("./geo_cache")
     geo_cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = geo_cache_dir / f"{gse_id}_microarray.parquet"
+    modified_path = geo_cache_dir / f"{gse_id}_microarray_modified.parquet"
+
     final_df.to_parquet(cache_path, compression="gzip")
+    final_df.to_parquet(modified_path, compression="gzip")
 
     meta_entry = {
         "path": cache_path,
+        "modified_path": modified_path,
         "filename": "microarray_matrix",
         "normalization_type": summ_norm,
         "n_genes": final_df.shape[0],
@@ -1060,18 +1099,77 @@ def fetch_microarray_matrix(meta: dict):
     gc.collect()
     return [meta_entry]
 
-@st.cache_data(show_spinner=False, max_entries=2)
-def dataframe_to_gzip_tsv(df: pd.DataFrame) -> bytes:
-    """Serialize a dataframe without materializing a second plain-text copy."""
-    output = io.BytesIO()
-    with gzip.GzipFile(fileobj=output, mode="wb") as gzip_file:
-        with io.TextIOWrapper(
-            gzip_file,
-            encoding="utf-8",
-            newline="",
-        ) as text_file:
-            df.to_csv(text_file, sep="\t", index=False)
-    return output.getvalue()
+class StreamWrapper(io.RawIOBase):
+    """Wraps a bytes-yielding generator into a read-only binary stream for Streamlit."""
+    def __init__(self, generator):
+        super().__init__()
+        self.gen = generator
+        self.leftover = b""
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        # Prevents crash when frameworks check seekability
+        return False
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        # Ignore non-fatal seek attempts (e.g. seek(0, SEEK_CUR))
+        if offset == 0 and whence in (io.SEEK_SET, io.SEEK_CUR):
+            return 0
+        raise io.UnsupportedOperation("stream is not seekable")
+
+    def tell(self) -> int:
+        return 0
+
+    def readinto(self, b):
+        try:
+            while len(self.leftover) < len(b):
+                chunk = next(self.gen)
+                self.leftover += chunk
+        except StopIteration:
+            pass
+
+        output, self.leftover = self.leftover[:len(b)], self.leftover[len(b):]
+        b[:len(output)] = output
+        return len(output)
+
+
+def stream_parquet_to_tsv_gz(parquet_path: str):
+    """Generator streaming TSV.GZ chunks directly from disk without stream corruption."""
+    parquet_file = pq.ParquetFile(parquet_path)
+    
+    # Custom buffer to capture written gzip bytes incrementally
+    class ChunkBuffer(io.RawIOBase):
+        def __init__(self):
+            self.chunks = []
+        def writable(self):
+            return True
+        def write(self, b):
+            self.chunks.append(bytes(b))
+            return len(b)
+        def get_and_clear(self):
+            data = b"".join(self.chunks)
+            self.chunks.clear()
+            return data
+
+    out_buf = ChunkBuffer()
+    
+    with gzip.GzipFile(fileobj=out_buf, mode="wb") as gz_file:
+        for record_batch in parquet_file.iter_batches(batch_size=5000):
+            df_chunk = record_batch.to_pandas()
+            tsv_data = df_chunk.to_csv(sep="\t", index=False, header=False).encode('utf-8')
+            gz_file.write(tsv_data)
+            gz_file.flush()
+            
+            chunk_data = out_buf.get_and_clear()
+            if chunk_data:
+                yield chunk_data
+
+    # Yield remaining bytes (including gzip trailer) after closing
+    final_data = out_buf.get_and_clear()
+    if final_data:
+        yield final_data
 
 # # # # # # # # # # # # # # # #
 # USER INTERFACE  # # # # # # # 
@@ -1141,6 +1239,7 @@ def survival_metadata_ui(char_df):
             hide_index = True
         )
 
+
         st.download_button(
             label="⬇ Download as .txt (tab-separated)",
             key = f"download_survival",
@@ -1149,8 +1248,9 @@ def survival_metadata_ui(char_df):
             mime="text/plain",
         )
 
+
 @st.fragment
-def annotate_columns(i, char_df, gse_id, df_key, source_path):
+def annotate_columns(i, char_df, gse_id, source_path, modified_path):
     with st.expander("Annotate Columns", expanded=False):
         st.write("Replace GSM column names with sample data")
 
@@ -1172,37 +1272,47 @@ def annotate_columns(i, char_df, gse_id, df_key, source_path):
                 for gsm in char_df.index:
                     column_mapping[gsm] = "_".join([str(char_df[x].loc[gsm]) for x in current_selection]) + f"_{gsm}"
 
-            base_df = pd.read_parquet(source_path)
+            modified_df = pq.read_table(modified_path)
 
-            current_norm = st.session_state.get(f"norm_type_{i}", "none")
-            if current_norm != "none":
-                base_df = apply_norm(base_df, current_norm, st.session_state.get(f"selected_columns_{i}", list(base_df.columns)), i, source_path)
-            
-            new_column_mapping = column_mapping.copy()
-            for col in base_df.columns.tolist():
-                for k in column_mapping.keys():
+            dynamic_mapping = {}
+            for col in modified_df.column_names:
+                for k, v in column_mapping.items():
                     if k in col:
-                        new_column_mapping[col] = column_mapping[k]
+                        dynamic_mapping[col] = v
+                        break 
+
+            new_column_names = [
+                dynamic_mapping.get(col, col) for col in modified_df.column_names
+            ]
+
+            modified_df = modified_df.rename_columns(new_column_names)
 
 
-            st.session_state[df_key] = base_df.rename(columns=new_column_mapping)
+            pq.write_table(
+                modified_df, 
+                modified_path, 
+                compression="snappy"
+            )
 
             st.session_state[f"selected_cols_dict_{gse_id}_{i}"] = {col: True for col in list(column_mapping.values())}
             st.session_state[f"selected_cols_dict_{gse_id}_{i}"]["Name"] = True
             st.rerun(scope="app")
 
 @st.fragment
-def column_selector(counts_df, i, gse_id):
+def column_selector(counts_path, i, gse_id):
+    parquet_file = pq.ParquetFile(counts_path)
+    all_columns = parquet_file.schema.names
+
     state_key = f"selected_cols_dict_{gse_id}_{i}"
     if state_key not in st.session_state:
-        st.session_state[state_key] = {col: True for col in counts_df.columns}
+        st.session_state[state_key] = {col: True for col in all_columns}
 
     search_term = st.text_input("Search columns", key=f"search_bar_{i}")
 
     filtered_columns = [
-        col for col in counts_df.columns
+        col for col in all_columns
         if search_term.lower() in col.lower()
-    ] if search_term else list(counts_df.columns)
+    ] if search_term else list(all_columns)
 
     def select_all():
         for col in filtered_columns:
@@ -1223,8 +1333,8 @@ def column_selector(counts_df, i, gse_id):
     with st.expander("Show All Columns", expanded=False):
         num_grid_cols = 4  
         grid_columns = st.columns(num_grid_cols)
-        
-    for idx, col in enumerate(filtered_columns):
+
+        for idx, col in enumerate(filtered_columns):
             def update_single_col(c=col):
                 st.session_state[state_key][c] = st.session_state[f"ui_{c}_{i}_key"]
 
@@ -1244,69 +1354,112 @@ def column_selector(counts_df, i, gse_id):
                 )
 
     selected_columns = [
-        col for col in counts_df.columns
+        col for col in all_columns
         if st.session_state[state_key].get(col, True)
     ]
     
     return selected_columns
 
-def apply_norm(df, norm, col_list, i, source_path):
-    base_df = pd.read_parquet(source_path)
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    numeric_cols = [n for n in numeric_cols if n in col_list]
-    
+def apply_norm(modified_path, norm, col_list, i, source_path):
+    target_cols = set(col_list)
+
+    schema = pq.read_schema(modified_path)
+    base_schema = pq.read_schema(source_path)
+    base_column_set = set(base_schema.names)
+
+    numeric_cols = [
+        field.name for field in schema 
+        if (pt.is_integer(field.type) or pt.is_floating(field.type)) and field.name in target_cols
+    ]
+
     base_gsm_cols = []
     valid_numeric_cols = []
-    
+
     for col in numeric_cols:
-        gsm_id = col.split("_")[-1]  
-        
-        if gsm_id in base_df.columns:
+        gsm_id = col.rsplit("_", 1)[-1] 
+        if gsm_id in base_column_set:
             base_gsm_cols.append(gsm_id)
             valid_numeric_cols.append(col)
-        elif col in base_df.columns:
+        elif col in base_column_set:
             base_gsm_cols.append(col)
             valid_numeric_cols.append(col)
 
     if not base_gsm_cols:
-        return df  
-    
-    numeric_df = base_df[base_gsm_cols]
+        return pq.read_table(modified_path)
 
-    del base_df
-    
-    numeric_df.columns = valid_numeric_cols
+    numeric_df = pq.read_table(source_path, columns=base_gsm_cols)
+    numeric_df = numeric_df.rename_columns(valid_numeric_cols)
+
     if norm == "none":
-        return df.assign(**{
-            col: numeric_df[col] for col in valid_numeric_cols
-        })
+        new_cols_df = numeric_df
 
-    if norm == "log2":
-        return df.assign(**{
-            col: np.log2(numeric_df[col] + 1) for col in valid_numeric_cols
-        })
+    elif norm == "log2":
+        new_cols_df = pa.Table.from_arrays(
+            [pc.log2(pc.add(numeric_df.column(col), 1.0)) for col in valid_numeric_cols],
+            names=valid_numeric_cols
+        )
 
-    if norm == "log10":
-        return df.assign(**{
-            col: np.log10(numeric_df[col] + 1) for col in valid_numeric_cols
-        })
+    elif norm == "log10":
+        new_cols_df = pa.Table.from_arrays(
+            [pc.log10(pc.add(numeric_df.column(col), 1.0)) for col in valid_numeric_cols],
+            names=valid_numeric_cols
+        )
 
-    if norm == "cpm":
-        cpm = numeric_df.div(numeric_df.sum(axis=0), axis=1) * 1e6
-        return df.assign(**cpm.to_dict("series"))
+    elif norm == "cpm":
+        processed_arrays = []
+        for col in valid_numeric_cols:
+            col_arr = numeric_df.column(col)
+            col_sum = pc.sum(col_arr).as_py()
 
-    if norm == "log2(cpm+1)":
-        cpm = numeric_df.div(numeric_df.sum(axis=0), axis=1) * 1e6
-        return df.assign(**{
-            col: np.log2(cpm[col] + 1) for col in valid_numeric_cols
-        })
+            cpm_arr = pc.multiply(pc.divide(col_arr, col_sum), 1e6)
+            processed_arrays.append(cpm_arr)
+            
+        new_cols_df = pa.Table.from_arrays(processed_arrays, names=valid_numeric_cols)
 
-    if norm == "log10(cpm+1)":
-        cpm = numeric_df.div(numeric_df.sum(axis=0), axis=1) * 1e6
-        return df.assign(**{
-            col: np.log10(cpm[col] + 1) for col in valid_numeric_cols
-        })
-        
+    elif norm == "log2(cpm+1)":
+        processed_arrays = []
+        for col in valid_numeric_cols:
+            col_arr = numeric_df.column(col)
+            col_sum = pc.sum(col_arr).as_py()
+            cpm_arr = pc.multiply(pc.divide(col_arr, col_sum), 1e6)
+            
+            log_cpm = pc.log2(pc.add(cpm_arr, 1.0))
+            processed_arrays.append(log_cpm)
+            
+        new_cols_df = pa.Table.from_arrays(processed_arrays, names=valid_numeric_cols)
+
+    elif norm == "log10(cpm+1)":
+        processed_arrays = []
+        for col in valid_numeric_cols:
+            col_arr = numeric_df.column(col)
+            col_sum = pc.sum(col_arr).as_py()
+            cpm_arr = pc.multiply(pc.divide(col_arr, col_sum), 1e6)
+            
+            log_cpm = pc.log10(pc.add(cpm_arr, 1.0))
+            processed_arrays.append(log_cpm)
+            
+        new_cols_df = pa.Table.from_arrays(processed_arrays, names=valid_numeric_cols)
+
+    else:
+        del numeric_df
+        gc.collect()
+        return pq.read_table(modified_path)
+
+    del numeric_df
+    gc.collect()
+
+    df = pq.read_table(modified_path)
+
+    overlapping_cols = set(valid_numeric_cols).intersection(df.column_names)
+    if overlapping_cols:
+        df = df.drop_columns(list(overlapping_cols))
+
+    for col_name in valid_numeric_cols:
+        df = df.append_column(col_name, new_cols_df.column(col_name))
+
+    del new_cols_df
+    gc.collect()
+
     return df
     
 if "result_lists" not in st.session_state:
@@ -1317,7 +1470,7 @@ if st.button("Fetch & Build Matrix", type="primary"):
     st.session_state.result_lists = None
 
     for key in list(st.session_state.keys()):
-        if str(key).startswith(("df_", "base_df_", "norm_type_", "preview_", "dl_bytes_", "selected_cols_dict_", "pill_selector_")):
+        if str(key).startswith(("df_", "base_df_", "norm_type_", "preview_", "selected_cols_dict_", "pill_selector_")):
             del st.session_state[key]
     
 
@@ -1377,11 +1530,6 @@ if st.session_state.result_lists is not None:
         if f"norm_type_{i}" not in st.session_state:
             st.session_state[f"norm_type_{i}"] = "none"
 
-        df_key = f"df_{i}"
-        preview_key = f"preview_{i}"
-
-        if preview_key not in st.session_state:
-            st.session_state[preview_key] = pd.read_parquet(meta_entry["path"]).head(PREVIEW_ROWS)
 
         original_normalization = meta_entry["normalization_type"]
         n_genes = meta_entry["n_genes"]
@@ -1399,47 +1547,7 @@ if st.session_state.result_lists is not None:
         c1.metric("Genes", f"{n_genes:,}")
         c2.metric("Samples", n_samples)
 
-        col_load, col_release = st.columns(2)
-        with col_load:
-            if df_key not in st.session_state:
-                col_info, col_button = st.columns([0.2, 0.9])
-                with col_info:
-                    with st.popover(label = ":material/info:"):
-                        st.write(
-                            "The full matrix is not loaded in memory yet. "
-                            "Click the button 'Load full matrix' to load it for annotation, renormalization, or download."
-                        )
-                with col_button:
-                    if st.button("Load full matrix", key=f"load_{i}"):
-                        st.session_state[df_key] = pd.read_parquet(meta_entry["path"])
-                        st.session_state.pop(preview_key, None)  # superseded by the live view below
-                        st.rerun()
-        with col_release:
-            if df_key in st.session_state:
-                col_info, col_button = st.columns([0.2, 0.9])
-                with col_info:
-                    with st.popover(":material/info:"):
-                        st.write("Allows you to annotate, normalize, or download other matrices while saving the changes you have made to this one. You can have a maximum of 2 matrices loaded at once. Release one of them to view more.")
-                with col_button:
-                    if st.button("Release from memory", key=f"release_{i}"):
-                        for k in (df_key, f"dl_bytes_{i}"):
-                            st.session_state.pop(k, None)
-                        gc.collect()
-                        st.rerun()
-
-        if df_key not in st.session_state:
-            st.dataframe(
-                st.session_state[preview_key],
-                width='stretch',
-                hide_index=True,
-                column_config={"Name": st.column_config.TextColumn("Name", pinned=True, width="small")},
-            )
-            st.caption(f"Preview: {len(st.session_state[preview_key]):,}/{n_genes:,} rows. Load the full matrix to annotate, renormalize, or download it.")
-            continue
-
-        df = st.session_state[df_key]
-
-        annotate_columns(i, st.session_state.char_df, gse_id, df_key, meta_entry["path"])
+        annotate_columns(i, st.session_state.char_df, gse_id, meta_entry["path"], meta_entry["modified_path"])
 
         with st.expander("Change Normalization", expanded=False):
             st.write(st.session_state["dp_text"])
@@ -1459,46 +1567,59 @@ if st.session_state.result_lists is not None:
             )
 
             st.write("Which columns would you like to apply it to?")
-            st.session_state[f"selected_columns_{i}"] = column_selector(df, i, gse_id)
+            st.session_state[f"selected_columns_{i}"] = column_selector(meta_entry["modified_path"], i, gse_id)
 
             submit_button = st.button(label="Renormalize", key=f"renormalize_{i}")
 
             if submit_button:
-                st.session_state[df_key] = apply_norm(
-                    st.session_state[df_key],
+                modified_df = apply_norm(
+                    meta_entry["modified_path"],
                     st.session_state[f"norm_type_{i}"],
-                    st.session_state[f"selected_columns_{i}"],  # fixed
+                    st.session_state[f"selected_columns_{i}"],  
                     i,
                     meta_entry["path"]
                 )
-                st.session_state.pop(f"dl_bytes_{i}", None)  # stale bytes, force rebuild
-                df = st.session_state[df_key]
+
+                pq.write_table(
+                    modified_df, 
+                    meta_entry["modified_path"], 
+                    compression="snappy"
+                )
+
+
 
         # Live view of the CURRENT df_key — reflects annotate/renormalize immediately
-        preview_cols = list(df.columns[:PREVIEW_COLUMNS])
+        parquet_file = pq.ParquetFile(meta_entry["modified_path"])
+        total_rows = parquet_file.metadata.num_rows
+        all_cols = parquet_file.schema.names
+        total_cols = len(all_cols)
 
-        if len(df) > PREVIEW_ROWS or len(df.columns) > PREVIEW_COLUMNS:
+        preview_cols = all_cols[:PREVIEW_COLUMNS]
+
+        if total_rows > PREVIEW_ROWS or total_cols > PREVIEW_COLUMNS:
             st.caption(
-                f"Showing {min(len(df), PREVIEW_ROWS):,}/{len(df):,} rows and "
-                f"{len(preview_cols):,}/{len(df.columns):,} columns. The download contains the complete matrix."
+                f"Showing {min(total_rows, PREVIEW_ROWS):,}/{total_rows:,} rows and "
+                f"{len(preview_cols):,}/{total_cols:,} columns. The download contains the complete matrix."
             )
 
-        if st.button("Prepare download", key=f"prep_dl_{i}"):
-            st.session_state[f"dl_bytes_{i}"] = dataframe_to_gzip_tsv(df)
-
-        if f"dl_bytes_{i}" in st.session_state:
-            norm_suffix = "_" + st.session_state[f"norm_type_{i}"] if st.session_state[f"norm_type_{i}"] != "none" else ""
-            st.download_button(
-                label="⬇ Download complete matrix (.txt.gz)",
-                key=f"download_{i}",
-                data=st.session_state[f"dl_bytes_{i}"],
-                file_name=f"{gse_id}_{original_normalization}{norm_suffix}.txt.gz",
-                mime="application/gzip",
-            )
+        dataset = ds.dataset(meta_entry["modified_path"], format="parquet")
+        preview_table = dataset.head(PREVIEW_ROWS, columns=preview_cols)
 
         st.dataframe(
-            df.loc[:, preview_cols].head(PREVIEW_ROWS),
-            width='stretch',
+            preview_table.to_pandas(),
+            use_container_width=True,
             hide_index=True,
             column_config={"Name": st.column_config.TextColumn("Name", pinned=True, width="small")},
+        )
+
+
+        current_norm = st.session_state.get(f"norm_type_{i}", "none")
+        norm_suffix = f"_{current_norm}" if current_norm != "none" else ""
+
+        st.download_button(
+            label="⬇ Download complete matrix (.txt.gz)",
+            key=f"download_{i}",
+            data=StreamWrapper(stream_parquet_to_tsv_gz(meta_entry["modified_path"])),
+            file_name=f"{gse_id}_{original_normalization}{norm_suffix}.txt.gz",
+            mime="application/gzip",
         )
