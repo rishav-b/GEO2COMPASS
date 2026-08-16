@@ -38,7 +38,7 @@ st.title("GEO-2-COMPASS")
 MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
 MAX_MATRIX_CELLS = 50_000_000
 PREVIEW_ROWS = 1_000
-PREVIEW_COLUMNS = 150
+PREVIEW_COLUMNS = 200
 
 loaded_keys = [k for k in st.session_state.keys() if k.startswith("df_")]
 
@@ -75,7 +75,11 @@ if "run_pipeline" not in st.session_state:
 if "selected_columns" not in st.session_state:
     st.session_state.selected_columns = []
 if "selected_gpl" not in st.session_state:
-    st.session_state.selected_gpl = ""
+    st.session_state.selected_gpl = []
+if "gpl_data" not in st.session_state:
+    st.session_state.gpl_data = {}
+if "current_gpl" not in st.session_state:
+    st.session_state.current_gpl = {}
 if "dp_text" not in st.session_state:
     st.session_state.dp_text = ""
 if "char_df" not in st.session_state:
@@ -184,22 +188,21 @@ def get_dp_and_char(gse, meta):
         x.split(": ", 1)[0]
         for x in first_gsm.metadata.get("characteristics_ch1", [])
     ))
-    char_df = pd.DataFrame(columns=char_list)
+    char_df = pd.DataFrame(index = meta["gsm_ids"], columns=char_list)
     for gsm in meta["gsm_ids"]:
         gsm_data = gse.gsms[gsm]
-        new_row = {}
+
    
         for x in gsm_data.metadata.get("characteristics_ch1", []):
             if ": " in x:
                 key, value = x.split(": ", 1)
-                new_row[key] = value
-            else:
-                new_row[x] = x
-        if "characteristics_ch1" in gsm_data.metadata:
-            char_df.loc[gsm_data.metadata["geo_accession"][0]] = new_row
+                char_df.loc[gsm, key] = value
+
         for key in ["treatment_protocol_ch1", "growth_protocol_ch1", "organism_ch1", "source_name_ch1", "title"]:
             if key in gsm_data.metadata:
                 char_df.loc[gsm_data.metadata["geo_accession"][0], key] = gsm_data.metadata[key][0]
+    
+    char_df = char_df.replace({np.nan: "None"})
     st.session_state["char_df"] = char_df.astype("string")
 
 try:
@@ -226,25 +229,14 @@ st.caption(
     f"Taxon: {meta['taxon']}"
 )
 
-if len(meta["gpl_ids"]) > 1:
-    selected_gpl = st.selectbox(
-        "Multiple platforms detected. Which platform would you like to use?",
-        tuple(f"{meta['gpl_ids'][i]}:  {meta['gpl_titles'][i]}" for i in range(len(meta['gpl_ids']))),
-        index=0,
-        placeholder="Select GPL"
-    )
-    if selected_gpl:
-        selected_gpl = selected_gpl.split(":  ")[0]
-        meta['gsm_ids'] = meta["gsm_gpl_dict"][selected_gpl]
-        meta['gpl_ids'] = [selected_gpl]
-    else:
-        st.info("Select one platform before building the matrix.")
-        st.stop()
-else:
-    selected_gpl = meta["gpl_ids"][0]
-st.session_state.selected_gpl = selected_gpl
 
-get_dp_and_char(GLOBAL_GSE, meta)
+
+
+
+
+st.session_state.selected_gpl = meta["gpl_ids"]
+print(st.session_state.selected_gpl)
+
 
 def needs_log(dp_text: str):
     yes_log = ["rma ", "(rma)", "lowess", "log", "vsn", "beadstudio","vsn","fhma","plier","quantile"]
@@ -369,6 +361,7 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
         return gpl_df, symbol_col
     else:
         gpl_df["new_id_col"] = gpl_df[best_col].astype(str).str.replace(r"_at$", "", regex=True)
+        gpl_df["new_id_col"] = gpl_df[best_col].astype(str).str.replace(r"\.\d+$", "", regex=True)
         if (str(gpl_df[best_col].iloc[0]).strip()[:3].lower() == "eg:"):
             gpl_df["new_id_col"] = gpl_df[best_col].astype(str).str.split(':').str[1]
 
@@ -389,60 +382,111 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
         gpl_df["gene_symbol"] = [mapping.get(id_, float("nan")) for id_ in gpl_df["new_id_col"]]
 
         return gpl_df, "gene_symbol"
+    
+def select_gpl(results):
+    gene_columns = [x[3] for x in results.values()]
+    if all([x == [] for x in gene_columns]):
+        gene_columns = [x[0][x[2]] for x in results.values()]
+
+    intersection = set()
+    union = set()
+
+    for g in gene_columns:
+        if len(intersection) == 0:
+            intersection = set(g)
+            union = union | set(g)
+        else:
+            intersection = intersection & set(g)
+            union = union | set(g)
+    if len(union) == 0:
+        return results
+    
+    if len(intersection)/len(union) > 0.85:
+        return results
+    else:
+        if len(meta["gpl_ids"]) > 1:
+            selected_gpl = st.selectbox(
+                "Multiple platforms detected. Which platform would you like to use?",
+                tuple(f"{meta['gpl_ids'][i]}:  {meta['gpl_titles'][i]}" for i in range(len(meta['gpl_ids']))),
+                index=0,
+                placeholder="Select GPL"
+            )
+            if selected_gpl:
+                for key in list(st.session_state.keys()):
+                    if str(key).startswith(("survival")):
+                        del st.session_state[key]
+                selected_gpl = selected_gpl.split(":  ")[0]
+                meta['gsm_ids'] = meta["gsm_gpl_dict"][selected_gpl]
+                meta['gpl_ids'] = [selected_gpl]
+            else:
+                st.info("Select one platform before building the matrix.")
+                st.stop()
+        else:
+            selected_gpl = meta["gpl_ids"][0]
+
+        return {selected_gpl: results[selected_gpl]}
+
+
         
-def get_gene_symbol_column(counts_df, selected_gpl = None, probe_ids=None):
+def get_gene_symbol_column(counts_df, probe_ids=None):
     gse = GLOBAL_GSE
+    results = {}
 
-    if not selected_gpl:
-        selected_gpl = st.session_state.selected_gpl
+    all_selected_gpls = st.session_state.selected_gpl
 
-    gpl_df = None
+    for selected_gpl in all_selected_gpls:
+        gpl_df = None
 
-    for gpl_name, gpl in getattr(gse, "gpls", {}).items():
-        if gpl_name == selected_gpl:
-            gpl_df = gpl.table
+        for gpl_name, gpl in getattr(gse, "gpls", {}).items():
+            if gpl_name == selected_gpl:
+                gpl_df = gpl.table
 
-    if gpl_df is None:
-        st.error(f"Platform '{selected_gpl}' not found in this GEO series.")
-        raise ValueError(f"Platform '{selected_gpl}' not found in this GEO series; skipping gene symbol annotation.")
-    
-    if probe_ids is not None:
-        index_set = {_normalize_id(v) for v in probe_ids}
-    else:
-        index_set = {_normalize_id(v) for v in counts_df.index}
-
-    if gpl_df is None or gpl_df.empty:
-        gpl_df = pd.DataFrame({"id": list(index_set)})
-        gpl_df["gene_symbol"] = gpl_df["id"]
-        gpl_df, symbol_col = gene_convert(gpl_df, gse, "id", "gene_symbol")
-
-        return gpl_df, "id", symbol_col
-    
-    best_col, best_score = _find_best_id_col(index_set, gpl_df)
-
-    
-
-    if best_score < 0.01:
-        print(f"  [warn] best overlap is only {best_score:.3f} — index may not match any GPL column")
-    
-    if gpl_df is not None:
-        symbol_col = None
-        symbol_col_score = 0
-        for col in gpl_df.columns:
-            values = gpl_df[col].replace("---", pd.NA).dropna()
-            if too_homogenous(values):
-                continue
-            col_score = values.apply(is_gene_symbol).mean()
-            print(f"  symbol candidate '{col}': {col_score:.3f}")
-            if col_score > symbol_col_score:
-                symbol_col_score = col_score
-                symbol_col = col
-        if symbol_col_score < 0.30: #arbitrary
-            gpl_df, symbol_col = gene_convert(gpl_df, gse, best_col, symbol_col)
+        if gpl_df is None:
+            st.error(f"Platform '{selected_gpl}' not found in this GEO series.")
+            raise ValueError(f"Platform '{selected_gpl}' not found in this GEO series; skipping gene symbol annotation.")
         
-        return gpl_df, best_col, symbol_col
-    else:
-        raise ValueError(f"No platform data found for {gse}")
+        if probe_ids is not None:
+            index_set = {_normalize_id(v) for v in probe_ids}
+        else:
+            index_set = {_normalize_id(v) for v in counts_df.index}
+
+        if gpl_df is None or gpl_df.empty:
+            gpl_df = pd.DataFrame({"id": list(index_set)})
+            gpl_df["gene_symbol"] = gpl_df["id"]
+            gpl_df, symbol_col = gene_convert(gpl_df, gse, "id", "gene_symbol")
+
+            continue
+        
+        best_col, best_score = _find_best_id_col(index_set, gpl_df)
+
+        
+
+        if best_score < 0.01:
+            print(f"  [warn] best overlap is only {best_score:.3f} — index may not match any GPL column")
+        
+        if gpl_df is not None:
+            symbol_col = None
+            symbol_col_score = 0
+            for col in gpl_df.columns:
+                values = gpl_df[col].replace("---", pd.NA).dropna()
+                if too_homogenous(values):
+                    continue
+                col_score = values.apply(is_gene_symbol).mean()
+                print(f"  symbol candidate '{col}': {col_score:.3f}")
+                if col_score > symbol_col_score:
+                    symbol_col_score = col_score
+                    symbol_col = col
+                print(f"{col}\t{col_score}")
+            if symbol_col_score < 0.30: #arbitrary
+                gpl_df, symbol_col = gene_convert(gpl_df, gse, best_col, symbol_col)
+            
+            results[selected_gpl] = [gpl_df, best_col, symbol_col]
+            
+        else:
+            raise ValueError(f"No platform data found for {gse}")
+        
+    
+    return results
     
 
 def _strip_version(s: str) -> str:
@@ -851,7 +895,7 @@ def _fetch_counts_df(accession, file_meta, url_bytes):
     else:
         return pd.DataFrame()
 
-def _annotate_counts(accession, selected, counts_df, selected_gpl):
+def _annotate_counts(accession, selected, counts_df):
     if selected[0].ncbi_data:
         annot_url = "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts&file=Human.GRCh38.p13.annot.tsv.gz"
         url_bytes = _download_all([annot_url])
@@ -871,24 +915,43 @@ def _annotate_counts(accession, selected, counts_df, selected_gpl):
         
         id_col = "GeneID"
         symbol_col = "Symbol"
+        results = {"ncbi": [annot_df, id_col, symbol_col]}
     else:
         try:
-            annot_df, id_col, symbol_col = get_gene_symbol_column(counts_df, selected_gpl = selected_gpl)
+            results = get_gene_symbol_column(counts_df)
         except ValueError as e:
             return counts_df
 
-    mapping     = dict(zip(annot_df[id_col].astype(str), annot_df[symbol_col].astype(str)))
-
-    mapping_lower = {str(k).lower(): v for k, v in mapping.items()}
-
-    orig_index = counts_df.index.astype(str)
-    new_index = orig_index.map(lambda x: mapping_lower.get(str(x).lower()))
     
+    mapping = {}
+    orig_index_str = counts_df.index.astype(str)
+    orig_index_lower = orig_index_str.str.lower()
+
+    for gpl, item in results.items():
+        annot_df, id_col, symbol_col = item[0], item[1], item[2]
+        
+        gpl_map = dict(zip(
+            annot_df[id_col].astype(str).str.lower(), 
+            annot_df[symbol_col].astype(str)
+        ))
+        
+        mapping.update(gpl_map)
+
+        mapped_genes = orig_index_lower.map(gpl_map).dropna().tolist()
+        
+        if isinstance(item, tuple):
+            results[gpl] = list(item) + [mapped_genes]
+        else:
+            results[gpl].append(mapped_genes)
+
+    new_index = orig_index_lower.map(mapping)
     counts_df.index = new_index.where(
-        new_index.notna() & (new_index != "nan"), orig_index
+        new_index.notna() & (new_index != "nan"), orig_index_str
     )
     counts_df.index.name = "gene_id"
-    print(f"  ✓ Index remapped using '{symbol_col}'")
+    
+    print(f"  ✓ Index remapped across {len(results)} GPL platform(s)")
+    st.session_state.gpl_data = results
     return counts_df
 
 
@@ -902,7 +965,6 @@ def _read_dp_text(geo, accession):
     return "\n".join(first_gsm.metadata.get("data_processing", []))
 
 def fetch_and_normalize(
-    selected_gpl,
     accession:     str,
     gsm_ids:      Optional[list[str]] = None,
     geo_cache_dir: str | Path = "./geo_cache",
@@ -951,13 +1013,17 @@ def fetch_and_normalize(
                   f"{MAX_MATRIX_CELLS:,}-cell limit")
             return None
 
-        counts_df = _annotate_counts(accession, selected, counts_df, selected_gpl)
+        counts_df = _annotate_counts(accession, selected, counts_df)
         counts_df = reduce_matrix_memory(counts_df)
 
-        retained_cols = [
-            col for col in counts_df.columns
-            if "gsm" not in col.lower() or any(gsm in col for gsm in gsm_ids)
-        ]
+        has_gsm_cols = any("gsm" in str(col).lower() for col in counts_df.columns if col != "Name")
+
+        if has_gsm_cols and gsm_ids:
+            retained_cols = [
+                col for col in counts_df.columns
+                if not any(g in col.lower() for g in ["gsm"]) or any(gsm in col for gsm in gsm_ids)
+            ]
+            counts_df = counts_df[retained_cols]
 
         counts_df = counts_df[retained_cols]
         counts_df.index.name = None
@@ -1001,7 +1067,6 @@ def fetch_and_normalize(
 def fetch_rnaseq_matrix(gse_id: str, meta):
     try:
         return fetch_and_normalize(
-            selected_gpl=st.session_state.selected_gpl,
             accession=gse_id,
             gsm_ids=meta["gsm_ids"],
             geo_cache_dir="./geo_cache",
@@ -1020,9 +1085,9 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
     df.rename(columns={df.columns[0]: "_probe_id"}, inplace=True)
 
     probe_ids = [str(pid).strip() for pid in df["_probe_id"]]
-    looks_like_symbols = sum([int(is_gene_symbol(pid)) for pid in probe_ids[:min(100, len(probe_ids))]])
-
-    if looks_like_symbols:
+    looks_like_symbols = sum([int(is_gene_symbol(pid)) for pid in probe_ids[:min(100, len(probe_ids))]])/100
+    
+    if looks_like_symbols > 0.90:
         df.insert(0, "Name", df["_probe_id"])
         df = df.drop("_probe_id", axis=1)
         return df
@@ -1030,7 +1095,8 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
     NULL_VALUES = {"---", "na", "", "null", "nan"}
 
     try:
-        gpl_table, matching_col, symbol_col = get_gene_symbol_column(
+        
+        results = get_gene_symbol_column(
             df, probe_ids=df["_probe_id"]
         )
     except ValueError as e:
@@ -1039,29 +1105,35 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
         df = df.drop("_probe_id", axis=1)
         return df
     
-    print(f"  → matching_col='{matching_col}'  symbol_col='{symbol_col}'")
-
     master_mapping: dict[str, str] = {}
-    if symbol_col in gpl_table.columns and matching_col in gpl_table.columns:
-        for probe, sym in zip(
-            gpl_table[matching_col].astype(str).str.strip(),
-            gpl_table[symbol_col].astype(str).str.strip(),
-        ):
-            if probe and sym and sym.lower() not in NULL_VALUES:
-                if "//" in sym:
-                    sym = re.split(r'///|//', sym)[1].strip()
-                master_mapping[probe] = sym
+    probe_series = df["_probe_id"].astype(str).str.strip()
 
-    df["Name"] = df["_probe_id"].astype(str).str.strip().map(master_mapping)
+    for gpl, item in results.items():
+        gpl_table, matching_col, symbol_col = item[0], item[1], item[2]
+        gpl_map = {}
 
-    before = len(df)
-    df = df.dropna(subset=["Name"])
-    after = len(df)
-    if before != after:
-        print(f"dropped {before - after} unmapped rows ({after} remaining)")
+        if symbol_col in gpl_table.columns and matching_col in gpl_table.columns:
+          
+            for probe, sym in zip(
+                gpl_table[matching_col].astype(str).str.strip(),
+                gpl_table[symbol_col].astype(str).str.strip(),
+            ):
+                if probe and sym and sym.lower() not in NULL_VALUES:
+                    if "//" in sym:
+                        sym = re.split(r'///|//', sym)[1].strip()
+                    gpl_map[probe] = sym
 
+
+        master_mapping.update(gpl_map)
+        mapped_genes = probe_series.map(gpl_map).dropna().tolist()
+        if isinstance(item, tuple):
+            results[gpl] = list(item) + [mapped_genes]
+        else:
+            results[gpl].append(mapped_genes)
+
+    st.session_state.gpl_data = results
+    df["Name"] = probe_series.map(master_mapping)
     df = df.drop("_probe_id", axis=1)
-    print(f"Remapped using '{matching_col}' → '{symbol_col}'")
     return df
 
 
@@ -1077,7 +1149,9 @@ def fetch_microarray_matrix(meta: dict):
     
     print(f"Microarray matrix contains {len(final_df.columns)} samples.")
     final_df = _annotate_matrix(final_df)
+
     final_df = reduce_matrix_memory(final_df)
+
 
     geo_cache_dir = Path("./geo_cache")
     geo_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1156,11 +1230,19 @@ def stream_parquet_to_tsv_gz(parquet_path: str):
     out_buf = ChunkBuffer()
     
     with gzip.GzipFile(fileobj=out_buf, mode="wb") as gz_file:
+        is_first_batch = True
         for record_batch in parquet_file.iter_batches(batch_size=5000):
             df_chunk = record_batch.to_pandas()
-            tsv_data = df_chunk.to_csv(sep="\t", index=False, header=False).encode('utf-8')
+            
+            if "Name" in df_chunk.columns:
+                cols = ["Name"] + [c for c in df_chunk.columns if c != "Name"]
+                df_chunk = df_chunk[cols]
+                
+            tsv_data = df_chunk.to_csv(sep="\t", index=False, header=is_first_batch).encode('utf-8')
             gz_file.write(tsv_data)
             gz_file.flush()
+
+            is_first_batch = False
             
             chunk_data = out_buf.get_and_clear()
             if chunk_data:
@@ -1177,12 +1259,13 @@ def stream_parquet_to_tsv_gz(parquet_path: str):
 
 @st.fragment
 def survival_metadata_ui(char_df):
+
     if char_df.empty or not len(char_df.columns):
         st.info("No sample characteristics are available for time-to-event data.")
         return
 
     if "survival_df" not in st.session_state:
-        st.session_state.survival_df = pd.DataFrame(index=char_df.index)
+        st.session_state.survival_df = pd.DataFrame(index=char_df.index, columns = ["GSM", "death", "days"])
         st.session_state.survival_df["GSM"] = char_df.index
 
     with st.expander("Generate Time-to-Event Data"):
@@ -1200,17 +1283,21 @@ def survival_metadata_ui(char_df):
 
         # Iterate safely over unique values
         unique_vals = sorted(list(char_df[mortality].dropna().unique()))
-        if [int(u) for u in unique_vals if str(u).isdigit()] == [0,1]:
-            st.session_state.survival_df["death"] = char_df[mortality]
-        else:
-            mapping = {}
-            for i in unique_vals:
-                mapping[i] = st.radio(
-                    label=f"Label '{i}' as no event (0) or event (1)",
-                    options=(0, 1),
-                    key=f"alive_dead_{i}"
-                )
-            st.session_state.survival_df["death"] = char_df[mortality].map(mapping)
+        filtered_vals = set(unique_vals)
+        
+        filtered_vals.discard(0)
+        filtered_vals.discard(1)
+        filtered_vals.discard("0")
+        filtered_vals.discard("1")
+
+        mapping = {"1": 1, 1: 1, "0": 0, 0: 0}
+        for i in filtered_vals:
+            mapping[i] = st.radio(
+                label=f"Label '{i}' as no event (0) or event (1)",
+                options=(0, 1),
+                key=f"alive_dead_{i}"
+            )
+        st.session_state.survival_df["death"] = char_df[mortality].map(mapping)
 
         t_mortality = st.selectbox(
             "Time to event column",
@@ -1261,7 +1348,7 @@ def annotate_columns(i, char_df, gse_id, source_path, modified_path):
             example_name = "_".join([str(char_df[x].iloc[0]) for x in current_selection])
             st.write(f"Example sample name: {example_name}_{char_df.index[0]}")
         else:
-            st.write(char_df.index[0])
+            st.write("")
 
         if st.button("Annotate Columns", key=f"annotate_columns_{i}"):
             column_mapping = {}
@@ -1301,7 +1388,12 @@ def annotate_columns(i, char_df, gse_id, source_path, modified_path):
 @st.fragment
 def column_selector(counts_path, i, gse_id):
     parquet_file = pq.ParquetFile(counts_path)
-    all_columns = parquet_file.schema.names
+    schema_names = parquet_file.schema.names
+
+    all_columns = [
+        col for col in schema_names 
+        if not col.startswith("GSM") or col in list(st.session_state.gpl_data.keys())
+    ]
 
     state_key = f"selected_cols_dict_{gse_id}_{i}"
     if state_key not in st.session_state:
@@ -1469,6 +1561,8 @@ if st.button("Fetch & Build Matrix", type="primary"):
     st.session_state.run_pipeline = True
     st.session_state.result_lists = None
 
+    get_dp_and_char(GLOBAL_GSE, meta)
+
     for key in list(st.session_state.keys()):
         if str(key).startswith(("df_", "base_df_", "norm_type_", "preview_", "selected_cols_dict_", "pill_selector_")):
             del st.session_state[key]
@@ -1496,7 +1590,21 @@ if st.session_state.run_pipeline and st.session_state.result_lists is None:
 
 if st.session_state.result_lists is not None:
     result_lists = st.session_state.result_lists
-    survival_metadata_ui(st.session_state.char_df) 
+
+    st.session_state.current_gpl = select_gpl(st.session_state.gpl_data)
+
+    char_df = st.session_state.char_df.copy()
+
+    gsm_filter = []
+    
+    for g in list(st.session_state.current_gpl.keys()):
+        gsm_filter.extend(meta["gsm_gpl_dict"][g])
+
+
+
+
+
+    survival_metadata_ui(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")]) 
     st.markdown("""
         <style>
             .normalization { 
@@ -1545,9 +1653,9 @@ if st.session_state.result_lists is not None:
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Genes", f"{n_genes:,}")
-        c2.metric("Samples", n_samples)
+        c2.metric("Samples", len(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")]))
 
-        annotate_columns(i, st.session_state.char_df, gse_id, meta_entry["path"], meta_entry["modified_path"])
+        annotate_columns(i, char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, meta_entry["path"], meta_entry["modified_path"])
 
         with st.expander("Change Normalization", expanded=False):
             st.write(st.session_state["dp_text"])
@@ -1591,10 +1699,24 @@ if st.session_state.result_lists is not None:
         # Live view of the CURRENT df_key — reflects annotate/renormalize immediately
         parquet_file = pq.ParquetFile(meta_entry["modified_path"])
         total_rows = parquet_file.metadata.num_rows
-        all_cols = parquet_file.schema.names
+        schema_names = parquet_file.schema.names
+
+        gsm_filter = []
+        
+        for g in list(st.session_state.current_gpl.keys()):
+            gsm_filter.extend(meta["gsm_gpl_dict"][g])
+        print(gsm_filter)
+        all_cols = [
+            col for col in schema_names 
+            if not "GSM" in col or col.split("_")[-1] in gsm_filter
+        ]
+
         total_cols = len(all_cols)
 
         preview_cols = all_cols[:PREVIEW_COLUMNS]
+
+        if "Name" in all_cols and "Name" not in preview_cols:
+            preview_cols[-1] = "Name"
 
         if total_rows > PREVIEW_ROWS or total_cols > PREVIEW_COLUMNS:
             st.caption(
