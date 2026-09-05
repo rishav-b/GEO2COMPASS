@@ -5,12 +5,14 @@ import io
 import json
 import os
 import re
+import ftplib
+import socket
 import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 from urllib.request import Request, urlopen
 import subprocess
 
@@ -235,7 +237,6 @@ st.caption(
 
 
 st.session_state.selected_gpl = meta["gpl_ids"]
-print(st.session_state.selected_gpl)
 
 
 def needs_log(dp_text: str):
@@ -370,16 +371,18 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
             results = gp.convert(organism=species, query=list(gpl_df["new_id_col"]),
                                 numeric_namespace=numeric_namespace, target_namespace=target_namespace)
             if results.empty or "name" not in results.columns:
-                st.warning("Gene symbol conversion returned no results; keeping original IDs.")
+                #st.warning("Gene symbol conversion returned no results; keeping original IDs.")
                 return gpl_df, symbol_col
         except Exception as e:
-            st.warning(f"Gene symbol conversion failed ({e}); keeping original IDs.")
+            #st.warning(f"Gene symbol conversion failed ({e}); keeping original IDs.")
             return gpl_df, symbol_col
         
         results_deduped = results.drop_duplicates(subset="incoming", keep="first")
         mapping = results_deduped.set_index("incoming")["name"]
-        gpl_df["gene_symbol"] = gpl_df["new_id_col"].values 
+        
+        #gpl_df["gene_symbol"] = gpl_df["new_id_col"].values 
         gpl_df["gene_symbol"] = [mapping.get(id_, float("nan")) for id_ in gpl_df["new_id_col"]]
+        print(gpl_df["gene_symbol"])
 
         return gpl_df, "gene_symbol"
     
@@ -428,11 +431,9 @@ def select_gpl(results):
 
 
         
-def get_gene_symbol_column(counts_df, probe_ids=None):
+def get_gene_symbol_column(counts_df, all_selected_gpls, probe_ids=None):
     gse = GLOBAL_GSE
     results = {}
-
-    all_selected_gpls = st.session_state.selected_gpl
 
     for selected_gpl in all_selected_gpls:
         gpl_df = None
@@ -442,7 +443,7 @@ def get_gene_symbol_column(counts_df, probe_ids=None):
                 gpl_df = gpl.table
 
         if gpl_df is None:
-            st.error(f"Platform '{selected_gpl}' not found in this GEO series.")
+            #st.error(f"Platform '{selected_gpl}' not found in this GEO series.")
             raise ValueError(f"Platform '{selected_gpl}' not found in this GEO series; skipping gene symbol annotation.")
         
         if probe_ids is not None:
@@ -453,9 +454,9 @@ def get_gene_symbol_column(counts_df, probe_ids=None):
         if gpl_df is None or gpl_df.empty:
             gpl_df = pd.DataFrame({"id": list(index_set)})
             gpl_df["gene_symbol"] = gpl_df["id"]
+            print("WOIFHOWIEJFIEWJ")
             gpl_df, symbol_col = gene_convert(gpl_df, gse, "id", "gene_symbol")
-
-            continue
+            results[selected_gpl] = [gpl_df, "id", symbol_col]
         
         best_col, best_score = _find_best_id_col(index_set, gpl_df)
 
@@ -607,69 +608,63 @@ def classify_normalization(dp_text: str) -> str:
         print("No clear normalization found.")
     return norm_type
 
-def _download_bytes(url: str) -> Optional[bytes]:
-    """Downloads a file using aria2c CLI and returns its raw bytes."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        filename = url.split("/")[-1]
-        # Handle query parameter style URLs (e.g., ...file=GSE123_raw.tsv.gz)
-        if "file=" in filename:
-            filename = filename.split("file=")[-1].split("&")[0]
-
-        cmd = [
-            "aria2c",
-            "-x", "16",
-            "-s", "16",
-            "-j", "1",
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "--dir", temp_dir,
-            "-o", filename,
-            "--quiet=true",
-            url,
-        ]
-
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"    ✗ aria2c failed for {filename}")
-            return None
-
-        file_path = os.path.join(temp_dir, filename)
-
-        if not os.path.exists(file_path):
-            return None
-
-        file_size = os.path.getsize(file_path)
-        if file_size > MAX_DOWNLOAD_BYTES:
-            print(f"    ✗ File exceeded size limit ({file_size / 1e6:.1f} MB)")
-            return None
-
-        with open(file_path, "rb") as f:
-            return f.read()
-
 
 def _download_all(urls: list[str]) -> dict[str, Optional[bytes]]:
     results: dict[str, Optional[bytes]] = {}
     if not urls:
         return results
 
-    print(f"  Downloading {len(urls)} file(s) using aria2c…")
+    print(f"  Downloading {len(urls)} file(s) via a single batched aria2c run…")
 
-    # Limit workers so we don't spam open thousands of connections simultaneously
-    workers = min(2, len(urls))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        fut_to_url = {ex.submit(_download_bytes, u): u for u in urls}
-        for fut in concurrent.futures.as_completed(fut_to_url):
-            url = fut_to_url[fut]
-            fname = url.split("/")[-1]
-            try:
-                res = fut.result()
-                results[url] = res
-                if res is not None:
-                    print(f"    ✓ {fname} ({len(res) / 1e6:.1f} MB)")
-                else:
-                    print(f"    ✗ {fname}: Failed or exceeded size limit")
-            except Exception as e:
-                print(f"    ✗ {fname}: {e}")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        url_to_fname = {}
+        input_lines = []
+        for u in urls:
+            fname = u.split("/")[-1]
+            if "file=" in fname:
+                fname = fname.split("file=")[-1].split("&")[0]
+            fname = requests.utils.unquote(fname)
+            url_to_fname[u] = fname
+            input_lines.append(u)
+            input_lines.append(f"  out={fname}")
+
+        input_file = os.path.join(temp_dir, "urls.txt")
+        with open(input_file, "w") as fh:
+            fh.write("\n".join(input_lines) + "\n")
+
+        cmd = [
+            "aria2c",
+            "-i", input_file,
+            "--dir", temp_dir,
+            "-j", "8",        
+            "-x", "16", "-s", "16",  
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "--continue=true",
+            "--max-tries=3",
+            "--retry-wait=2",
+            "--quiet=true",
+            "--allow-overwrite=true",
+        ]
+
+        try:
+            subprocess.run(cmd, check=False) 
+        except Exception as e:
+            print(f"    ✗ aria2c batch run failed: {e}")
+
+        for u, fname in url_to_fname.items():
+            file_path = os.path.join(temp_dir, fname)
+            if not os.path.exists(file_path):
+                print(f"    ✗ {fname}: missing (download failed)")
+                results[u] = None
+                continue
+            size = os.path.getsize(file_path)
+            if size > MAX_DOWNLOAD_BYTES:
+                print(f"    ✗ {fname}: {size/1e6:.1f} MB exceeded limit")
+                results[u] = None
+                continue
+            with open(file_path, "rb") as fh:
+                results[u] = fh.read()
+            print(f"    ✓ {fname} ({size/1e6:.1f} MB)")
 
     return results
 
@@ -689,45 +684,91 @@ def _decompress(raw: bytes, name: str) -> tuple[bytes, str]:
 def _detect_sep(name: str) -> str:
     return "," if name.lower().endswith(".csv") else "\t"
 
+def _geo_ftp_folder(accession: str) -> tuple[str, str]:
+    m = re.match(r'^(GSE|GSM|GPL|GDS)(\d+)$', accession.strip())
+    if not m:
+        raise ValueError(f"Unrecognized GEO accession: {accession}")
+    prefix, num = m.groups()
+    top = {"GSE": "series", "GSM": "samples", "GPL": "platforms", "GDS": "datasets"}[prefix]
+    folder = f"{prefix}{num[:-3]}nnn" if len(num) > 3 else f"{prefix}nnn"
+    return top, folder
+
+
+NCBI_FTP_HOST = "ftp.ncbi.nlm.nih.gov"
+def _list_geo_files_ftp(accession, subdirs=("suppl",)):
+    top, folder = _geo_ftp_folder(accession)
+    base = f"/geo/{top}/{folder}/{accession}"
+
+    out = []
+    ftp = ftplib.FTP(NCBI_FTP_HOST, timeout=30)
+    ftp.login()  # anonymous
+    try:
+        for sub in subdirs:
+            path = f"{base}/{sub}"
+            try:
+                ftp.cwd(path)
+            except ftplib.error_perm:
+                continue  # this accession has no suppl/ dir, etc.
+
+            try:
+                entries = list(ftp.mlsd())
+            except (ftplib.error_perm, AttributeError):
+                entries = [(n, {}) for n in ftp.nlst()]  # last-resort fallback
+
+            for name, facts in entries:
+                if name in (".", "..") or facts.get("type") == "dir":
+                    continue
+                size = int(facts["size"]) if facts.get("size") else None
+                out.append({
+                    "filename": name,
+                    "size": size,
+                    "url": f"https://{NCBI_FTP_HOST}{path}/{quote(name)}",
+                })
+    finally:
+        ftp.quit()
+    return out
+
+def _list_geo_files_https_fallback(accession: str, subdirs=("suppl",)) -> list[dict]:
+    top, folder = _geo_ftp_folder(accession)
+    base = f"/geo/{top}/{folder}/{accession}"
+
+    out = []
+    for sub in subdirs:
+        url = f"https://{NCBI_FTP_HOST}{base}/{sub}/"
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+        except requests.exceptions.RequestException:
+            continue
+        soup = BeautifulSoup(r.text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href in ("../",) or href.startswith("?"):
+                continue
+            filename = href.rstrip("/")
+            if filename:
+                out.append({"filename": filename, "size": None, "url": urljoin(url, href)})
+    return out
+
+def _list_geo_files(accession: str, subdirs=("suppl",)) -> list[dict]:
+    try:
+        files = _list_geo_files_ftp(accession, subdirs)
+        if files:
+            return files
+    except (socket.error, OSError, ftplib.all_errors) as e:
+        print(f"  FTP listing failed ({e}); falling back to HTTPS autoindex…")
+    return _list_geo_files_https_fallback(accession, subdirs)
+
 
 #tested
 def _scrape_geo_download_page(accession):
-    page_url = f"https://www.ncbi.nlm.nih.gov/geo/download/?acc={accession}"
-    print(f"  Scraping GEO download page: {page_url}")
- 
-    try:
-        r = requests.get(page_url, timeout=60)
-        r.raise_for_status()
-    except requests.exceptions.Timeout:
-        st.error("GEO download page timed out. Try again in a moment.")
-        st.stop()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Could not reach GEO download page: {e}")
-        st.stop()
-
-    soup = BeautifulSoup(r.text, "html.parser")
- 
-    seen = set()
+    raw_files = _list_geo_files(accession, subdirs = ("suppl",))
     files = []
- 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
- 
-        if "file=" in href:
-            filename = href.split("file=")[-1].split("&")[0]
-        elif "suppl/" in href:
-            filename = href.split("suppl/")[-1]
-        else:
-            continue
-
-        if not filename or filename in seen:
-            continue
-        seen.add(filename)
- 
-        full_url = urljoin(page_url, href)
-        lower    = filename.lower()
+    for f in raw_files:
+        filename, full_url, size = f["filename"], f["url"], f.get("size")
+        lower = filename.lower()
         is_tar   = lower.endswith(".tar") or lower.endswith(".tar.gz")
-        ncbi_data = "file=" in href
+        ncbi_data = "file=" in full_url
 
         if (any(s in lower for s in ["raw", "rsem", "unnorm","htseq-count","feature"])):
             normalization = "raw_counts"
@@ -744,10 +785,15 @@ def _scrape_geo_download_page(accession):
         else:
             normalization = "unknown"
 
+
         print(f"\n\n\n {filename} \t {normalization} \n\n\n")
             
  
         if not (is_tar or _is_tabular(filename)) or "annot" in filename:
+            print(f"    [skip] {filename}")
+            continue
+
+        if size is not None and size > MAX_DOWNLOAD_BYTES:
             print(f"    [skip] {filename}")
             continue
         
@@ -895,13 +941,13 @@ def _fetch_counts_df(accession, file_meta, url_bytes):
     else:
         return pd.DataFrame()
 
-def _annotate_counts(accession, selected, counts_df):
+def _annotate_counts(accession, selected, counts_df, all_selected_gpls):
     if selected[0].ncbi_data:
         annot_url = "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts&file=Human.GRCh38.p13.annot.tsv.gz"
         url_bytes = _download_all([annot_url])
         raw = url_bytes.get(annot_url)
         if raw is None:
-            st.warning("Annotation file too large or failed to download; skipping gene symbol mapping.")
+            #st.warning("Annotation file too large or failed to download; skipping gene symbol mapping.")
             return counts_df
         filename = annot_url.split("file=")[-1]
 
@@ -918,7 +964,7 @@ def _annotate_counts(accession, selected, counts_df):
         results = {"ncbi": [annot_df, id_col, symbol_col]}
     else:
         try:
-            results = get_gene_symbol_column(counts_df)
+            results = get_gene_symbol_column(counts_df,all_selected_gpls)
         except ValueError as e:
             return counts_df
 
@@ -989,6 +1035,8 @@ def fetch_and_normalize(
     results_meta = []
 
     url_bytes = _download_all([c.url for c in candidates])
+
+    all_selected_gpls = st.session_state.selected_gpl
     
     def process_candidate(c):
         selected = [c]
@@ -1013,11 +1061,11 @@ def fetch_and_normalize(
                   f"{MAX_MATRIX_CELLS:,}-cell limit")
             return None
 
-        counts_df = _annotate_counts(accession, selected, counts_df)
+        counts_df = _annotate_counts(accession, selected, counts_df, all_selected_gpls)
         counts_df = reduce_matrix_memory(counts_df)
 
         has_gsm_cols = any("gsm" in str(col).lower() for col in counts_df.columns if col != "Name")
-
+        retained_cols = list(counts_df.columns)
         if has_gsm_cols and gsm_ids:
             retained_cols = [
                 col for col in counts_df.columns
@@ -1041,7 +1089,7 @@ def fetch_and_normalize(
             "filename": c.filename,
             "normalization_type": c.normalization,
             "n_genes": counts_df.shape[0],
-            "n_samples": counts_df.shape[1] - 1,
+            "n_samples": counts_df.shape[1] -1,
         })
 
         del counts_df
@@ -1097,7 +1145,7 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
     try:
         
         results = get_gene_symbol_column(
-            df, probe_ids=df["_probe_id"]
+            df, st.session_state.selected_gpl, probe_ids=df["_probe_id"]
         )
     except ValueError as e:
         st.warning(f"{e} Keeping original probe IDs.")
@@ -1118,7 +1166,7 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
                 gpl_table[matching_col].astype(str).str.strip(),
                 gpl_table[symbol_col].astype(str).str.strip(),
             ):
-                if probe and sym and sym.lower() not in NULL_VALUES:
+                if probe and sym and str(sym).lower() not in NULL_VALUES:
                     if "//" in sym:
                         sym = re.split(r'///|//', sym)[1].strip()
                     gpl_map[probe] = sym
