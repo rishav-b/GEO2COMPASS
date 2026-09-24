@@ -2,6 +2,7 @@ import concurrent.futures
 import gc
 import gzip
 import io
+import itertools
 import json
 import os
 import re
@@ -12,7 +13,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin, quote, unquote
 from urllib.request import Request, urlopen
 import subprocess
 
@@ -78,7 +79,8 @@ with st.expander("🔍 tracemalloc: allocation growth since last rerun", expande
 
 def _deep_size(v) -> int:
     if isinstance(v, (pd.DataFrame, pd.Series)):
-        return int(v.memory_usage(deep=True).sum())
+        x = v.memory_usage(deep=True)
+        return int(x) if isinstance(x, float) or isinstance(x, int) else int(x.sum())
     if isinstance(v, dict):
         return sys.getsizeof(v) + sum(_deep_size(x) for x in v.values())
     if isinstance(v, (list, tuple, set)):
@@ -679,7 +681,7 @@ def _download_all(urls: list[str], dest_dir: Path) -> dict[str, Optional[Path]]:
         fname = u.split("/")[-1]
         if "file=" in fname:
             fname = fname.split("file=")[-1].split("&")[0]
-        fname = requests.utils.unquote(fname)
+        fname = unquote(fname)
         url_to_fname[u] = fname
         input_lines.append(u)
         input_lines.append(f"  out={fname}")
@@ -810,7 +812,7 @@ def _list_geo_files(accession: str, subdirs=("suppl",)) -> list[dict]:
         files = _list_geo_files_ftp(accession, subdirs)
         if files:
             return files
-    except (socket.error, OSError, ftplib.all_errors) as e:
+    except tuple(list(ftplib.all_errors) + [OSError]) as e:
         print(f"  FTP listing failed ({e}); falling back to HTTPS autoindex…")
     return _list_geo_files_https_fallback(accession, subdirs)
 
@@ -893,40 +895,88 @@ def _parse_tabular_series(raw: bytes, filename: str) -> tuple[pd.Series, str]:
     return s, stem
 
 
-def _build_matrix_from_tar(url_bytes, file_meta):
-    series_list = []
+def _parse_tar_member(raw: bytes, filename: str) -> tuple[pd.Series, str]:
+    is_gz = filename.lower().endswith(".gz")
+    bare_name = filename[:-3] if is_gz else filename
+    sep = _detect_sep(bare_name)
 
+    buf = io.BytesIO(raw)
+    reader = gzip.GzipFile(fileobj=buf) if is_gz else buf
+
+    df = pd.read_csv(reader, sep=sep, comment="#", header=0)
+
+    mask = df.iloc[:, 0].astype(str).str.startswith("__")
+    if mask.any():
+        df = df.loc[~mask]
+
+    num_cols = [c for c in df.columns if pd.to_numeric(df[c], errors="coerce").notna().all()]
+    str_cols = [c for c in df.columns if c not in num_cols]
+
+    if not num_cols:
+        raise ValueError(f"No numeric columns in {filename}")
+
+    gene_index = df[str_cols[0]].astype(str) if str_cols else df.index.astype(str)
+    s = pd.to_numeric(df[num_cols[0]], errors="coerce", downcast="float")
+    s.index = gene_index
+
+    stem = re.sub(r"\.(csv|tsv|txt|tab)$", "", bare_name, flags=re.IGNORECASE)
+    return s, stem
+
+
+def _iter_tar_members(path_map, file_meta):
     for meta in file_meta:
-        raw = url_bytes.get(meta.url)
-        if raw is None:
+        path = path_map.get(meta.url)
+        if path is None:
             continue
-        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tf:
+        with tarfile.open(name=str(path), mode="r:*") as tf:
             for member in tf:
                 if not member.isfile():
                     continue
                 mname = Path(member.name).name
-                
                 if not _is_tabular(mname):
                     continue
                 extracted = tf.extractfile(member)
                 if extracted is None:
                     continue
+                yield mname, extracted.read()
+
+
+def _build_matrix_from_tar(path_map, file_meta):
+
+    max_workers = min(8, (os.cpu_count() or 4))
+    batch_size = max_workers * 4
+
+    series_list: list[pd.Series] = []
+    members = _iter_tar_members(path_map, file_meta)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        while True:
+            batch = list(itertools.islice(members, batch_size))
+            if not batch:
+                break
+
+            futures = [
+                executor.submit(_parse_tar_member, mbytes, mname)
+                for mname, mbytes in batch
+            ]
+            del batch  # release this batch's raw bytes as soon as workers pick them up
+
+            for future in concurrent.futures.as_completed(futures):
                 try:
-                    mbytes, bare = _decompress(extracted.read(), mname)
-                    s, sname = _parse_tabular_series(mbytes, bare)
+                    s, sname = future.result()
                     s.name = sname
                     series_list.append(s)
-                    del mbytes
                 except Exception as e:
-                    print(f"    [warn] {mname}: {e}")
-                    return pd.DataFrame()
- 
+                    # Skip just the bad sample instead of discarding the whole matrix.
+                    print(f"    [warn] skipping unreadable sample: {e}")
+
     if not series_list:
         return pd.DataFrame()
- 
+
     print(f"\n  Merging {len(series_list)} sample series from TAR…")
-    df = pd.concat(series_list, axis=1, join="outer")
-    df = df.apply(pd.to_numeric, errors="coerce")
+    df = pd.concat(series_list, axis=1, join="outer", copy=False)
+    series_list.clear()
+    gc.collect()
     df.index.name = "gene_id"
     print(f"  ✓ Matrix: {df.shape[0]} genes × {df.shape[1]} samples")
     return df
@@ -984,39 +1034,57 @@ def _build_matrix_from_flat_files(url_bytes, file_meta):
     return merged
     
 
-def _fetch_counts_df(accession, file_meta, url_bytes):
+def _fetch_counts_df(accession, file_meta, path_map):
+    """path_map maps FileMeta.url -> on-disk Path (not bytes). Tar archives are
+    streamed straight from disk; flat files are small enough to read in full."""
 
     tar_files  = [m for m in file_meta if m.is_tar]
     flat_files = [m for m in file_meta if not m.is_tar]
- 
+
     if tar_files:
-        return _build_matrix_from_tar(url_bytes, tar_files)
+        return _build_matrix_from_tar(path_map, tar_files)
     elif flat_files:
-        return _build_matrix_from_flat_files(url_bytes, flat_files)
+        raw_map = {}
+        for m in flat_files:
+            p = path_map.get(m.url)
+            if p is None:
+                continue
+            with open(p, "rb") as fh:
+                raw_map[m.url] = fh.read()
+        return _build_matrix_from_flat_files(raw_map, flat_files)
     else:
         return pd.DataFrame()
 
 def _annotate_counts(accession, selected, counts_df, all_selected_gpls):
     if selected[0].ncbi_data:
         annot_url = "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts&file=Human.GRCh38.p13.annot.tsv.gz"
-        url_bytes = _download_all([annot_url])
-        raw = url_bytes.get(annot_url)
-        if raw is None:
-            #st.warning("Annotation file too large or failed to download; skipping gene symbol mapping.")
-            return counts_df
-        filename = annot_url.split("file=")[-1]
+        with tempfile.TemporaryDirectory() as download_dir:
+            download_dir = Path(download_dir)
+            url_bytes = _download_all([annot_url], download_dir)
+            path = url_bytes.get(annot_url)
+            if path is None:
+                print(f"    Exceeded file size, skipping {annot_url}")
+                return counts_df, {}
 
-        if filename.endswith(".gz"):
-            raw = gzip.decompress(raw)
-            filename = filename[:-3]
+            with open(path, "rb") as fh:
+                raw = fh.read()
 
-        annot_df = pd.read_csv(
-            io.BytesIO(raw), sep=_detect_sep(filename), on_bad_lines="skip",
-        )
-        
-        id_col = "GeneID"
-        symbol_col = "Symbol"
-        results = {"ncbi": [annot_df, id_col, symbol_col]}
+            if raw is None:
+                #st.warning("Annotation file too large or failed to download; skipping gene symbol mapping.")
+                return counts_df, {}
+            filename = annot_url.split("file=")[-1]
+
+            if filename.endswith(".gz"):
+                raw = gzip.decompress(raw)
+                filename = filename[:-3]
+
+            annot_df = pd.read_csv(
+                io.BytesIO(raw), sep=_detect_sep(filename), on_bad_lines="skip",
+            )
+            
+            id_col = "GeneID"
+            symbol_col = "Symbol"
+            results = {"ncbi": [annot_df, id_col, symbol_col]}
     else:
         try:
             results = get_gene_symbol_column(counts_df,all_selected_gpls)
@@ -1055,16 +1123,6 @@ def _annotate_counts(accession, selected, counts_df, all_selected_gpls):
     # st.session_state.gpl_data = results
     return counts_df, results
 
-
-def _read_dp_text(geo, accession):
-    if accession.startswith("GSE"):
-        gsm_dict = geo.gsms
-    else:
-        gsm_dict = {accession: geo}
- 
-    first_gsm = next(iter(gsm_dict.values()))
-    return "\n".join(first_gsm.metadata.get("data_processing", []))
-
 def fetch_and_normalize(
     accession: str,
     gsm_ids: Optional[list[str]] = None,
@@ -1090,14 +1148,50 @@ def fetch_and_normalize(
 
     with tempfile.TemporaryDirectory() as download_dir:
         download_dir = Path(download_dir)
-        url_paths = _download_all([c.url for c in candidates], download_dir)
+
+        def _is_cached(c):
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", c.filename)
+            return (geo_cache_dir / f"{accession}_{safe_name}.parquet").exists() and \
+                   (geo_cache_dir / f"{accession}_{safe_name}_modified.parquet").exists()
+
+        to_download = [c for c in candidates if not _is_cached(c)]
+        url_paths = _download_all([c.url for c in to_download], download_dir)
 
         all_selected_gpls = st.session_state.selected_gpl
+
+        def _safe_name(filename: str) -> str:
+            return re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
 
         def process_candidate(c):
             selected = [c]
             if c.normalization == "unknown":
                 c.normalization = inferred_norm
+
+            safe_name = _safe_name(c.filename)
+            cache_path = geo_cache_dir / f"{accession}_{safe_name}.parquet"
+            modified_path = geo_cache_dir / f"{accession}_{safe_name}_modified.parquet"
+
+            if cache_path.exists() and modified_path.exists():
+                try:
+                    cached_meta = pq.read_metadata(cache_path)
+                    print(f"    [cache hit] {c.filename} — reusing cached matrix")
+                    return {
+                        "meta": {
+                            "path": cache_path,
+                            "modified_path": modified_path,
+                            "filename": c.filename,
+                            "normalization_type": c.normalization,
+                            "n_genes": cached_meta.num_rows,
+                            "n_samples": cached_meta.num_columns - 1,
+                        },
+                        # Gene-symbol mapping results aren't persisted across
+                        # reruns; an empty dict here just means the platform
+                        # dropdown / overlap check re-derives them lazily
+                        # from st.session_state.selected_gpl as before.
+                        "gpl_results": {},
+                    }
+                except Exception as e:
+                    print(f"    [cache] unreadable cache for {c.filename} ({e}); rebuilding")
 
             print(f"\n  Processing: {c.filename}")
 
@@ -1106,11 +1200,9 @@ def fetch_and_normalize(
                 print(f"    Exceeded file size, skipping {c.url}")
                 return None
 
-            with open(path, "rb") as fh:
-                raw = fh.read()
-
-            counts_df = _fetch_counts_df(accession, selected, {c.url: raw})
-            del raw
+            # Pass the on-disk path straight through; tar archives are streamed
+            # member-by-member instead of being fully read into RAM here.
+            counts_df = _fetch_counts_df(accession, selected, {c.url: path})
             gc.collect()
 
             if counts_df.empty:
@@ -1122,6 +1214,7 @@ def fetch_and_normalize(
                 return None
 
             counts_df, gpl_results = _annotate_counts(accession, selected, counts_df, all_selected_gpls)
+            print(counts_df.head)
             counts_df = reduce_matrix_memory(counts_df)
 
             has_gsm_cols = any("gsm" in str(col).lower() for col in counts_df.columns if col != "Name")
@@ -1133,15 +1226,19 @@ def fetch_and_normalize(
                 ]
                 counts_df = counts_df[retained_cols]
 
+            print('check1')
+
             counts_df = counts_df[retained_cols]
             counts_df.index.name = None
             counts_df.insert(0, "Name", counts_df.index)
             counts_df.reset_index(drop=True, inplace=True)
 
-            cache_path = geo_cache_dir / f"{accession}_{c.filename}_{id(c)}.parquet"
-            modified_path = geo_cache_dir / f"{accession}_{c.filename}_{id(c)}_modified.parquet"
+            print('check2')
+
             counts_df.to_parquet(cache_path, compression="gzip")
             counts_df.to_parquet(modified_path, compression="gzip")
+
+            print('check3')
 
             meta_entry = {
                 "path": cache_path,
@@ -1153,6 +1250,7 @@ def fetch_and_normalize(
             }
 
             del counts_df
+            print('check4')
             return {"meta": meta_entry, "gpl_results": gpl_results}
 
         max_workers = min(4, len(candidates))
@@ -1162,6 +1260,8 @@ def fetch_and_normalize(
 
             for future in concurrent.futures.as_completed(futures):
                 res = future.result()
+                if not res:
+                    print('woah')
                 if res is not None:
                     results_meta.append(res["meta"])
                     merged_gpl_data.update(res["gpl_results"])
@@ -1169,6 +1269,7 @@ def fetch_and_normalize(
     st.session_state.gpl_data = merged_gpl_data
 
     gc.collect()
+    print(results_meta)
     return results_meta
 
 def fetch_rnaseq_matrix(gse_id: str, meta):
@@ -1665,9 +1766,17 @@ def apply_norm(modified_path, norm, col_list, i, source_path):
 if "result_lists" not in st.session_state:
     st.session_state.result_lists = None
 
-if st.button("Fetch & Build Matrix", type="primary"):
+if "_pipeline_busy" not in st.session_state:
+    st.session_state._pipeline_busy = False
+
+if st.button(
+    "Fetch & Build Matrix",
+    type="primary",
+    disabled=st.session_state._pipeline_busy,
+):
     st.session_state.run_pipeline = True
     st.session_state.result_lists = None
+    st.session_state._pipeline_busy = True
 
     get_dp_and_char(GLOBAL_GSE, meta)
 
@@ -1700,9 +1809,11 @@ if st.session_state.run_pipeline and st.session_state.result_lists is None:
 
         if not result_lists:
             status.update(label="Pipeline failed.", state="error")
+            st.session_state._pipeline_busy = False
             st.error("No usable expression matrix was found for this accession.")
             st.stop()
         st.session_state.result_lists = result_lists
+        st.session_state._pipeline_busy = False
         status.update(label="Done!", state="complete")
 
 if st.session_state.result_lists is not None:
