@@ -4,15 +4,15 @@ import gzip
 import io
 import json
 import os
+import shutil
 import re
 import tarfile
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, parse_qs, urlparse
 from urllib.request import Request, urlopen
-import subprocess
 
 # PyArrow 25.0.0 can segfault when Streamlit initializes Arrow from a
 # ScriptRunner thread. Use the system allocator even if the deployment
@@ -75,7 +75,11 @@ if "run_pipeline" not in st.session_state:
 if "selected_columns" not in st.session_state:
     st.session_state.selected_columns = []
 if "selected_gpl" not in st.session_state:
-    st.session_state.selected_gpl = ""
+    st.session_state.selected_gpl = []
+if "gpl_data" not in st.session_state:
+    st.session_state.gpl_data = {}
+if "current_gpl" not in st.session_state:
+    st.session_state.current_gpl = {}
 if "dp_text" not in st.session_state:
     st.session_state.dp_text = ""
 if "char_df" not in st.session_state:
@@ -138,8 +142,8 @@ def fetch_metadata(gse_id: str, gse) -> dict:
 
 @st.cache_resource(
     show_spinner="Downloading and parsing GEO metadata…",
-    ttl=3600,
-    max_entries=1,
+    ttl=300,
+    max_entries=2,
 )
 def get_gse(gse_id):
     url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{gse_id[:-3]}nnn/{gse_id}/soft/{gse_id}_family.soft.gz"
@@ -226,23 +230,7 @@ st.caption(
     f"Taxon: {meta['taxon']}"
 )
 
-if len(meta["gpl_ids"]) > 1:
-    selected_gpl = st.selectbox(
-        "Multiple platforms detected. Which platform would you like to use?",
-        tuple(f"{meta['gpl_ids'][i]}:  {meta['gpl_titles'][i]}" for i in range(len(meta['gpl_ids']))),
-        index=0,
-        placeholder="Select GPL"
-    )
-    if selected_gpl:
-        selected_gpl = selected_gpl.split(":  ")[0]
-        meta['gsm_ids'] = meta["gsm_gpl_dict"][selected_gpl]
-        meta['gpl_ids'] = [selected_gpl]
-    else:
-        st.info("Select one platform before building the matrix.")
-        st.stop()
-else:
-    selected_gpl = meta["gpl_ids"][0]
-st.session_state.selected_gpl = selected_gpl
+st.session_state.selected_gpl = meta["gpl_ids"]
 
 get_dp_and_char(GLOBAL_GSE, meta)
 
@@ -262,7 +250,7 @@ def needs_log(dp_text: str):
     return False, dp_text
 
 def to_cpm(df):
-    numeric_df = df.apply(pd.to_numeric, errors="coerce")
+    numeric_df = df.apply(pd.to_numeric, downcast = "float", errors="coerce")
     col_sums = numeric_df.sum(axis=0).replace(0, np.nan)
     return numeric_df.divide(col_sums, axis=1) * 1e6
 
@@ -377,10 +365,10 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
             results = gp.convert(organism=species, query=list(gpl_df["new_id_col"]),
                                 numeric_namespace=numeric_namespace, target_namespace=target_namespace)
             if results.empty or "name" not in results.columns:
-                st.warning("Gene symbol conversion returned no results; keeping original IDs.")
+                #st.warning("Gene symbol conversion returned no results; keeping original IDs.")
                 return gpl_df, symbol_col
         except Exception as e:
-            st.warning(f"Gene symbol conversion failed ({e}); keeping original IDs.")
+            #st.warning(f"Gene symbol conversion failed ({e}); keeping original IDs.")
             return gpl_df, symbol_col
         
         results_deduped = results.drop_duplicates(subset="incoming", keep="first")
@@ -390,59 +378,115 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
 
         return gpl_df, "gene_symbol"
         
-def get_gene_symbol_column(counts_df, selected_gpl = None, probe_ids=None):
+def select_gpl(results):
+    gene_columns = []
+    for x in results.values():
+        mapped = x[3] if len(x) > 3 else []
+        if mapped:
+            gene_columns.append(mapped)
+        else:
+            gpl_df, symbol_col = x[0], x[2]
+            if symbol_col is not None and symbol_col in getattr(gpl_df, "columns", []):
+                gene_columns.append(gpl_df[symbol_col].dropna().astype(str).tolist())
+            else:
+                gene_columns.append([])
+ 
+    intersection = set()
+    union = set()
+
+ 
+    for g in gene_columns:
+        if len(intersection) == 0:
+            intersection = set(g)
+            union = union | set(g)
+        else:
+            intersection = intersection & set(g)
+            union = union | set(g)
+    if len(union) == 0:
+        return results
+    
+    print(len(intersection) / len(union))
+
+    if len(intersection) / len(union) > 0.65:
+        return results
+    else:
+        if len(meta["gpl_ids"]) > 1:
+            selected_gpl = st.selectbox(
+                "Multiple platforms detected. Which platform would you like to use?",
+                tuple(f"{meta['gpl_ids'][i]}:  {meta['gpl_titles'][i]}" for i in range(len(meta['gpl_ids']))),
+                index=0,
+                placeholder="Select GPL"
+            )
+            if selected_gpl:
+                for key in list(st.session_state.keys()):
+                    if str(key).startswith(("survival")):
+                        del st.session_state[key]
+                gc.collect()
+                selected_gpl = selected_gpl.split(":  ")[0]
+                meta['gsm_ids'] = meta["gsm_gpl_dict"][selected_gpl]
+                meta['gpl_ids'] = [selected_gpl]
+            else:
+                st.info("Select one platform before building the matrix.")
+                st.stop()
+        else:
+            selected_gpl = meta["gpl_ids"][0]
+ 
+        return {selected_gpl: results[selected_gpl]}
+
+
+def get_gene_symbol_column(counts_df, all_selected_gpls, probe_ids=None):
     gse = GLOBAL_GSE
+    results = {}
 
-    if not selected_gpl:
-        selected_gpl = st.session_state.selected_gpl
+    for selected_gpl in all_selected_gpls:
+        gpl_df = None
 
-    gpl_df = None
+        for gpl_name, gpl in getattr(gse, "gpls", {}).items():
+            if gpl_name == selected_gpl:
+                gpl_df = gpl.table
 
-    for gpl_name, gpl in getattr(gse, "gpls", {}).items():
-        if gpl_name == selected_gpl:
-            gpl_df = gpl.table
+        if gpl_df is None:
+            raise ValueError(f"Platform '{selected_gpl}' not found in this GEO series; skipping gene symbol annotation.")
 
-    if gpl_df is None:
-        st.error(f"Platform '{selected_gpl}' not found in this GEO series.")
-        raise ValueError(f"Platform '{selected_gpl}' not found in this GEO series; skipping gene symbol annotation.")
-    
-    if probe_ids is not None:
-        index_set = {_normalize_id(v) for v in probe_ids}
-    else:
-        index_set = {_normalize_id(v) for v in counts_df.index}
+        if probe_ids is not None:
+            index_set = {_normalize_id(v) for v in probe_ids}
+        else:
+            index_set = {_normalize_id(v) for v in counts_df.index}
 
-    if gpl_df is None or gpl_df.empty:
-        gpl_df = pd.DataFrame({"id": list(index_set)})
-        gpl_df["gene_symbol"] = gpl_df["id"]
-        gpl_df, symbol_col = gene_convert(gpl_df, gse, "id", "gene_symbol")
+        if gpl_df is None or gpl_df.empty:
+            gpl_df = pd.DataFrame({"id": list(index_set)})
+            gpl_df["gene_symbol"] = gpl_df["id"]
+            print("LOLLAPALOOZA")
 
-        return gpl_df, "id", symbol_col
-    
-    best_col, best_score = _find_best_id_col(index_set, gpl_df)
+            gpl_df, symbol_col = gene_convert(gpl_df, gse, "id", "gene_symbol")
+            results[selected_gpl] = [gpl_df, "id", symbol_col]
+            continue
 
-    
+        best_col, best_score = _find_best_id_col(index_set, gpl_df)
 
-    if best_score < 0.01:
-        print(f"  [warn] best overlap is only {best_score:.3f} — index may not match any GPL column")
-    
-    if gpl_df is not None:
-        symbol_col = None
-        symbol_col_score = 0
-        for col in gpl_df.columns:
-            values = gpl_df[col].replace("---", pd.NA).dropna()
-            if too_homogenous(values):
-                continue
-            col_score = values.apply(is_gene_symbol).mean()
-            print(f"  symbol candidate '{col}': {col_score:.3f}")
-            if col_score > symbol_col_score:
-                symbol_col_score = col_score
-                symbol_col = col
-        if symbol_col_score < 0.30: #arbitrary
-            gpl_df, symbol_col = gene_convert(gpl_df, gse, best_col, symbol_col)
-        
-        return gpl_df, best_col, symbol_col
-    else:
-        raise ValueError(f"No platform data found for {gse}")
+        if best_score < 0.01:
+            print(f"  [warn] best overlap is only {best_score:.3f} — index may not match any GPL column")
+
+        if gpl_df is not None:
+            symbol_col = None
+            symbol_col_score = 0
+            for col in gpl_df.columns:
+                values = gpl_df[col].replace("---", pd.NA).dropna()
+                if too_homogenous(values):
+                    continue
+                col_score = values.apply(is_gene_symbol).mean()
+                print(f"  symbol candidate '{col}': {col_score:.3f}")
+                if col_score > symbol_col_score:
+                    symbol_col_score = col_score
+                    symbol_col = col
+            if symbol_col_score < 0.30: #arbitrary
+                gpl_df, symbol_col = gene_convert(gpl_df, gse, best_col, symbol_col)
+
+            results[selected_gpl] = [gpl_df, best_col, symbol_col]
+        else:
+            raise ValueError(f"No platform data found for {gse}")
+
+    return results
     
 
 def _strip_version(s: str) -> str:
@@ -562,56 +606,28 @@ def classify_normalization(dp_text: str) -> str:
         norm_type = "unknown"
         print("No clear normalization found.")
     return norm_type
+ 
+def _download_bytes(url: str, cap = MAX_DOWNLOAD_BYTES) -> Optional[bytes]:
+    buf = io.BytesIO()
+    with requests.get(url, stream=True, timeout=(30, 300)) as r:
+        r.raise_for_status()
+        for chunk in r.iter_content(1024 * 1024):
+            buf.write(chunk)
+            if buf.tell() > cap:
+                return None
+    return buf.getvalue()
 
-def _download_bytes(url: str) -> Optional[bytes]:
-    """Downloads a file using aria2c CLI and returns its raw bytes."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        filename = url.split("/")[-1]
-        # Handle query parameter style URLs (e.g., ...file=GSE123_raw.tsv.gz)
-        if "file=" in filename:
-            filename = filename.split("file=")[-1].split("&")[0]
-
-        cmd = [
-            "aria2c",
-            "-x", "16",
-            "-s", "16",
-            "-j", "1",
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "--dir", temp_dir,
-            "-o", filename,
-            "--quiet=true",
-            url,
-        ]
-
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"    ✗ aria2c failed for {filename}")
-            return None
-
-        file_path = os.path.join(temp_dir, filename)
-
-        if not os.path.exists(file_path):
-            return None
-
-        file_size = os.path.getsize(file_path)
-        if file_size > MAX_DOWNLOAD_BYTES:
-            print(f"    ✗ File exceeded size limit ({file_size / 1e6:.1f} MB)")
-            return None
-
-        with open(file_path, "rb") as f:
-            return f.read()
-
-
+ 
+ 
 def _download_all(urls: list[str]) -> dict[str, Optional[bytes]]:
     results: dict[str, Optional[bytes]] = {}
     if not urls:
         return results
-
+ 
     print(f"  Downloading {len(urls)} file(s) using aria2c…")
-
+ 
     # Limit workers so we don't spam open thousands of connections simultaneously
-    workers = min(2, len(urls))
+    workers = min(1, len(urls))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         fut_to_url = {ex.submit(_download_bytes, u): u for u in urls}
         for fut in concurrent.futures.as_completed(fut_to_url):
@@ -626,7 +642,7 @@ def _download_all(urls: list[str]) -> dict[str, Optional[bytes]]:
                     print(f"    ✗ {fname}: Failed or exceeded size limit")
             except Exception as e:
                 print(f"    ✗ {fname}: {e}")
-
+ 
     return results
 
 #simple helper functions
@@ -642,8 +658,55 @@ def _decompress(raw: bytes, name: str) -> tuple[bytes, str]:
     return raw, name
 
 
-def _detect_sep(name: str) -> str:
-    return "," if name.lower().endswith(".csv") else "\t"
+def detect_delimiter(
+    raw_bytes: bytes,
+    candidates=(",", "\t", ";", "|", "\n", "\r\n", "\r", " ", "~"),
+    sample_size: int = 16384,
+):
+    """Detects both column separator and record/row terminator from raw bytes.
+
+    Evaluates candidate pairs (col_sep, row_sep) by scoring grid uniformity.
+    """
+    text = raw_bytes[:sample_size].decode("utf-8", errors="ignore")
+
+    best_pair = (",", "\n")
+    best_score = -1.0
+
+    # Evaluate every combination of column separator S and record separator R
+    for r_sep in candidates:
+        # Split records using candidate row separator
+        records = [r for r in text.split(r_sep) if r.strip()][:30]
+        if len(records) < 2:
+            continue
+
+        for c_sep in candidates:
+            if c_sep == r_sep:
+                continue
+
+            # Count fields per record
+            row_lengths = [len(rec.split(c_sep)) for rec in records]
+            if not row_lengths:
+                continue
+
+            avg_cols = sum(row_lengths) / len(row_lengths)
+
+            # Ignore single-column results or empty splits
+            if avg_cols <= 1.05:
+                continue
+
+            # Calculate variance in column count across records
+            variance = sum((x - avg_cols) ** 2 for x in row_lengths) / len(
+                row_lengths
+            )
+
+            # Score prioritizes high field count with perfect uniformity (0 variance)
+            score = (avg_cols * len(records)) / (1.0 + (variance * 10.0))
+
+            if score > best_score:
+                best_score = score
+                best_pair = (c_sep, r_sep)
+
+    return best_pair
 
 
 #tested
@@ -716,7 +779,7 @@ def _scrape_geo_download_page(accession):
 #constructing the dataframe
 
 def _parse_tabular_series(raw: bytes, filename: str) -> tuple[pd.Series, str]:
-    sep = _detect_sep(filename)
+    sep = detect_delimiter(raw)[0]
     df  = pd.read_csv(
         io.StringIO(raw.decode("utf-8", errors="replace")),
         sep=sep, comment="#", header=0,
@@ -781,7 +844,7 @@ def _build_matrix_from_tar(url_bytes, file_meta):
  
     print(f"\n  Merging {len(series_list)} sample series from TAR…")
     df = pd.concat(series_list, axis=1, join="outer")
-    df = df.apply(pd.to_numeric, errors="coerce")
+    df = df.apply(lambda c: pd.to_numeric(c, errors="coerce", downcast="float"))
     df.index.name = "gene_id"
     print(f"  ✓ Matrix: {df.shape[0]} genes × {df.shape[1]} samples")
     return df
@@ -798,22 +861,25 @@ def _build_matrix_from_flat_files(url_bytes, file_meta):
             if filename.endswith(".gz"):
                 raw = gzip.decompress(raw)
                 filename = filename[:-3]
-            sep = _detect_sep(filename)
 
             lower = filename.lower()
             if lower.endswith(".xls") or lower.endswith(".xlsx"):
                 df = pd.read_excel(io.BytesIO(raw), index_col=0)
             else:
+                sr = detect_delimiter(raw)
                 df = pd.read_csv(
-                    io.BytesIO(raw), sep=_detect_sep(filename),
+                    io.BytesIO(raw), sep=sr[0],
+                    lineterminator= sr[1],
                     index_col=0, on_bad_lines="skip",
                 )
+                numeric_cols = df.select_dtypes(include=[np.number]).columns
+                df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, downcast="float")
             
 
             if df.columns.str.startswith('Unnamed').all():
                 df.columns = df.iloc[0]
 
-            df = df.apply(pd.to_numeric, errors = "coerce")
+            df = df.apply(pd.to_numeric, downcast = "float", errors = "coerce")
             df.index.name = "gene_id"
 
             df = df[~df.index.astype(str).str.startswith("__")]
@@ -851,45 +917,54 @@ def _fetch_counts_df(accession, file_meta, url_bytes):
     else:
         return pd.DataFrame()
 
-def _annotate_counts(accession, selected, counts_df, selected_gpl):
+def _annotate_counts(accession, selected, counts_df, all_selected_gpls):
     if selected[0].ncbi_data:
-        annot_url = "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts&file=Human.GRCh38.p13.annot.tsv.gz"
-        url_bytes = _download_all([annot_url])
-        raw = url_bytes.get(annot_url)
-        if raw is None:
-            st.warning("Annotation file too large or failed to download; skipping gene symbol mapping.")
-            return counts_df
-        filename = annot_url.split("file=")[-1]
-
-        if filename.endswith(".gz"):
-            raw = gzip.decompress(raw)
-            filename = filename[:-3]
+        raw = b""
+        with gzip.open("annot/Human.GRCh38.p13.annot.tsv.gz", "rb") as f:
+            raw = f.read()
 
         annot_df = pd.read_csv(
-            io.BytesIO(raw), sep=_detect_sep(filename), on_bad_lines="skip",
+            io.BytesIO(raw), sep= "\t", on_bad_lines="skip",
         )
         
         id_col = "GeneID"
         symbol_col = "Symbol"
+        results = {"ncbi": [annot_df, id_col, symbol_col]}
     else:
         try:
-            annot_df, id_col, symbol_col = get_gene_symbol_column(counts_df, selected_gpl = selected_gpl)
+            results = get_gene_symbol_column(counts_df, all_selected_gpls)
         except ValueError as e:
-            return counts_df
+            return counts_df, {}
 
-    mapping     = dict(zip(annot_df[id_col].astype(str), annot_df[symbol_col].astype(str)))
+    mapping = {}
+    orig_index_str = counts_df.index.astype(str)
+    orig_index_lower = orig_index_str.str.lower()
 
-    mapping_lower = {str(k).lower(): v for k, v in mapping.items()}
+    for gpl, item in results.items():
+        annot_df, id_col, symbol_col = item[0], item[1], item[2]
 
-    orig_index = counts_df.index.astype(str)
-    new_index = orig_index.map(lambda x: mapping_lower.get(str(x).lower()))
-    
+        gpl_map = dict(zip(
+            annot_df[id_col].astype(str).str.lower(),
+            annot_df[symbol_col].astype(str)
+        ))
+
+        mapping.update(gpl_map)
+
+        mapped_genes = orig_index_lower.map(gpl_map).dropna().tolist()
+
+        if isinstance(item, tuple):
+            results[gpl] = list(item) + [mapped_genes]
+        else:
+            results[gpl].append(mapped_genes)
+
+    new_index = orig_index_lower.map(mapping)
     counts_df.index = new_index.where(
-        new_index.notna() & (new_index != "nan"), orig_index
+        new_index.notna() & (new_index != "nan"), orig_index_str
     )
     counts_df.index.name = "gene_id"
-    print(f"  ✓ Index remapped using '{symbol_col}'")
-    return counts_df
+    print(f"  ✓ Index remapped across {len(results)} GPL platform(s)")
+    
+    return counts_df, results
 
 
 def _read_dp_text(geo, accession):
@@ -902,7 +977,6 @@ def _read_dp_text(geo, accession):
     return "\n".join(first_gsm.metadata.get("data_processing", []))
 
 def fetch_and_normalize(
-    selected_gpl,
     accession:     str,
     gsm_ids:      Optional[list[str]] = None,
     geo_cache_dir: str | Path = "./geo_cache",
@@ -925,9 +999,16 @@ def fetch_and_normalize(
         return []
 
     results_meta = []
+    merged_gpl_data = {}
 
-    url_bytes = _download_all([c.url for c in candidates])
-    
+    # url_bytes = _download_all([c.url for c in candidates])
+
+    #annot_url = "https://www.ncbi.nlm.nih.gov/geo/download/?format=file&type=rnaseq_counts&file=Human.GRCh38.p13.annot.tsv.gz"
+    #annot_bytes = _download_all([annot_url])[annot_url]
+    #raw = url_bytes.get(annot_url)
+
+    all_selected_gpls = st.session_state.selected_gpl
+
     def process_candidate(c):
         selected = [c]
         if c.normalization == "unknown":
@@ -935,10 +1016,12 @@ def fetch_and_normalize(
 
         print(f"\n  Processing: {c.filename}")
 
+        url_bytes = _download_all([c.url])
+
         if url_bytes.get(c.url) is None:
             print(f"    Exceeded file size, skipping {c.url}")
             return None
-
+        
         counts_df = _fetch_counts_df(accession, selected, url_bytes)
 
         gc.collect()
@@ -951,8 +1034,8 @@ def fetch_and_normalize(
                   f"{MAX_MATRIX_CELLS:,}-cell limit")
             return None
 
-        counts_df = _annotate_counts(accession, selected, counts_df, selected_gpl)
-        counts_df = reduce_matrix_memory(counts_df)
+        counts_df, gpl_results = _annotate_counts(accession, selected, counts_df, all_selected_gpls)
+        #counts_df = reduce_matrix_memory(counts_df)
 
         retained_cols = [
             col for col in counts_df.columns
@@ -967,18 +1050,19 @@ def fetch_and_normalize(
         cache_path = geo_cache_dir / f"{accession}_{c.filename}_{id(c)}.parquet"
         modified_path = geo_cache_dir / f"{accession}_{c.filename}_{id(c)}_modified.parquet"
         counts_df.to_parquet(cache_path, compression="gzip")
-        counts_df.to_parquet(modified_path, compression = "gzip")
+        shutil.copy(cache_path, modified_path)
 
-        results_meta.append({
+        meta_entry = {
             "path": cache_path,
             "modified_path": modified_path,
             "filename": c.filename,
             "normalization_type": c.normalization,
             "n_genes": counts_df.shape[0],
             "n_samples": counts_df.shape[1] - 1,
-        })
+        }
 
         del counts_df
+        return {"meta": meta_entry, "gpl_results": gpl_results}
     
 
     max_workers = min(4, len(candidates))
@@ -991,17 +1075,18 @@ def fetch_and_normalize(
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res is not None:
-                results_meta.append(res)
+                results_meta.append(res["meta"])
+                merged_gpl_data.update(res["gpl_results"])
     
+    st.session_state.gpl_data = merged_gpl_data
+
     gc.collect()
-    del url_bytes
 
     return results_meta
 
 def fetch_rnaseq_matrix(gse_id: str, meta):
     try:
         return fetch_and_normalize(
-            selected_gpl=st.session_state.selected_gpl,
             accession=gse_id,
             gsm_ids=meta["gsm_ids"],
             geo_cache_dir="./geo_cache",
@@ -1020,39 +1105,48 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
     df.rename(columns={df.columns[0]: "_probe_id"}, inplace=True)
 
     probe_ids = [str(pid).strip() for pid in df["_probe_id"]]
-    looks_like_symbols = sum([int(is_gene_symbol(pid)) for pid in probe_ids[:min(100, len(probe_ids))]])
+    looks_like_symbols = sum([int(is_gene_symbol(pid)) for pid in probe_ids[:min(100, len(probe_ids))]]) / 100
 
-    if looks_like_symbols:
+    if looks_like_symbols > 0.90:
         df.insert(0, "Name", df["_probe_id"])
         df = df.drop("_probe_id", axis=1)
+        st.session_state.gpl_data = {}
         return df
 
     NULL_VALUES = {"---", "na", "", "null", "nan"}
 
     try:
-        gpl_table, matching_col, symbol_col = get_gene_symbol_column(
-            df, probe_ids=df["_probe_id"]
+        results = get_gene_symbol_column(
+            df, st.session_state.selected_gpl, probe_ids=df["_probe_id"]
         )
     except ValueError as e:
         st.warning(f"{e} Keeping original probe IDs.")
         df.insert(0, "Name", df["_probe_id"])
         df = df.drop("_probe_id", axis=1)
+        st.session_state.gpl_data = {}
         return df
-    
-    print(f"  → matching_col='{matching_col}'  symbol_col='{symbol_col}'")
 
     master_mapping: dict[str, str] = {}
-    if symbol_col in gpl_table.columns and matching_col in gpl_table.columns:
-        for probe, sym in zip(
-            gpl_table[matching_col].astype(str).str.strip(),
-            gpl_table[symbol_col].astype(str).str.strip(),
-        ):
-            if probe and sym and sym.lower() not in NULL_VALUES:
-                if "//" in sym:
-                    sym = re.split(r'///|//', sym)[1].strip()
-                master_mapping[probe] = sym
+    probe_series = df["_probe_id"].astype(str).str.strip()
 
-    df["Name"] = df["_probe_id"].astype(str).str.strip().map(master_mapping)
+    for gpl, item in results.items():
+        gpl_table, matching_col, symbol_col = item[0], item[1], item[2]
+        gpl_map = {}
+
+        if symbol_col in gpl_table.columns and matching_col in gpl_table.columns:
+            for probe, sym in zip(
+                gpl_table[matching_col].astype(str).str.strip(),
+                gpl_table[symbol_col].astype(str).str.strip(),
+            ):
+                if probe and sym and str(sym).lower() not in NULL_VALUES:
+                    if "//" in sym:
+                        sym = re.split(r'///|//', sym)[1].strip()
+                    gpl_map[probe] = sym
+
+        master_mapping.update(gpl_map)
+
+    st.session_state.gpl_data = results
+    df["Name"] = probe_series.map(master_mapping)
 
     before = len(df)
     df = df.dropna(subset=["Name"])
@@ -1061,7 +1155,7 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
         print(f"dropped {before - after} unmapped rows ({after} remaining)")
 
     df = df.drop("_probe_id", axis=1)
-    print(f"Remapped using '{matching_col}' → '{symbol_col}'")
+    print(f"Remapped across {len(results)} GPL platform(s)")
     return df
 
 
@@ -1085,7 +1179,7 @@ def fetch_microarray_matrix(meta: dict):
     modified_path = geo_cache_dir / f"{gse_id}_microarray_modified.parquet"
 
     final_df.to_parquet(cache_path, compression="gzip")
-    final_df.to_parquet(modified_path, compression="gzip")
+    shutil.copy(cache_path, modified_path)
 
     meta_entry = {
         "path": cache_path,
@@ -1472,6 +1566,7 @@ if st.button("Fetch & Build Matrix", type="primary"):
     for key in list(st.session_state.keys()):
         if str(key).startswith(("df_", "base_df_", "norm_type_", "preview_", "selected_cols_dict_", "pill_selector_")):
             del st.session_state[key]
+    gc.collect()
     
 
 if st.session_state.run_pipeline and st.session_state.result_lists is None:
@@ -1496,7 +1591,16 @@ if st.session_state.run_pipeline and st.session_state.result_lists is None:
 
 if st.session_state.result_lists is not None:
     result_lists = st.session_state.result_lists
-    survival_metadata_ui(st.session_state.char_df) 
+
+    st.session_state.current_gpl = select_gpl(st.session_state.gpl_data)
+
+    char_df = st.session_state.char_df.copy()
+
+    gsm_filter = []
+    for g in list(st.session_state.current_gpl.keys()):
+        gsm_filter.extend(meta["gsm_gpl_dict"][g])
+
+    survival_metadata_ui(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")])
     st.markdown("""
         <style>
             .normalization { 
@@ -1545,9 +1649,9 @@ if st.session_state.result_lists is not None:
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Genes", f"{n_genes:,}")
-        c2.metric("Samples", n_samples)
+        c2.metric("Samples", len(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")]))
 
-        annotate_columns(i, st.session_state.char_df, gse_id, meta_entry["path"], meta_entry["modified_path"])
+        annotate_columns(i, char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, meta_entry["path"], meta_entry["modified_path"])
 
         with st.expander("Change Normalization", expanded=False):
             st.write(st.session_state["dp_text"])
@@ -1591,10 +1695,28 @@ if st.session_state.result_lists is not None:
         # Live view of the CURRENT df_key — reflects annotate/renormalize immediately
         parquet_file = pq.ParquetFile(meta_entry["modified_path"])
         total_rows = parquet_file.metadata.num_rows
-        all_cols = parquet_file.schema.names
+        schema_names = parquet_file.schema.names
+
+        gsm_filter = {
+            gsm
+            for g in st.session_state.current_gpl.keys()
+            for gsm in meta.get("gsm_gpl_dict", {}).get(g, [])
+        }
+
+        all_cols = []
+        for col in schema_names:
+            if "GSM" not in col.upper():
+                all_cols.append(col)
+            else:
+                match = re.search(r"GSM\d+", col, re.IGNORECASE)
+                if match and match.group(0).upper() in gsm_filter:
+                    all_cols.append(col)
         total_cols = len(all_cols)
 
-        preview_cols = all_cols[:PREVIEW_COLUMNS]
+        if "Name" in all_cols[:PREVIEW_COLUMNS]:
+            preview_cols = all_cols[:PREVIEW_COLUMNS]
+        else:
+            preview_cols = ["Name"] + all_cols[:PREVIEW_COLUMNS-1]
 
         if total_rows > PREVIEW_ROWS or total_cols > PREVIEW_COLUMNS:
             st.caption(
