@@ -624,8 +624,6 @@ def _download_all(urls: list[str]) -> dict[str, Optional[bytes]]:
     if not urls:
         return results
  
-    print(f"  Downloading {len(urls)} file(s) using aria2c…")
- 
     # Limit workers so we don't spam open thousands of connections simultaneously
     workers = min(1, len(urls))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
