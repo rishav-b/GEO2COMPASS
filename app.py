@@ -15,6 +15,7 @@ from urllib.parse import urljoin, parse_qs, urlparse
 from urllib.request import Request, urlopen
 import plotly.express as px
 from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
  
 # PyArrow 25.0.0 can segfault when Streamlit initializes Arrow from a
 # ScriptRunner thread. Use the system allocator even if the deployment
@@ -25,6 +26,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.types as pt
 import pyarrow.dataset as ds
+import duckdb
 import GEOparse
 import numpy as np
 import pandas as pd
@@ -1252,99 +1254,29 @@ def fetch_microarray_matrix(meta: dict):
     gc.collect()
     return [meta_entry]
  
-class StreamWrapper(io.RawIOBase):
-    """Wraps a bytes-yielding generator into a read-only binary stream for Streamlit."""
-    def __init__(self, generator):
-        super().__init__()
-        self.gen = generator
-        self.leftover = b""
  
-    def readable(self) -> bool:
-        return True
- 
-    def seekable(self) -> bool:
-        # Prevents crash when frameworks check seekability
-        return False
- 
-    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        # Ignore non-fatal seek attempts (e.g. seek(0, SEEK_CUR))
-        if offset == 0 and whence in (io.SEEK_SET, io.SEEK_CUR):
-            return 0
-        raise io.UnsupportedOperation("stream is not seekable")
- 
-    def tell(self) -> int:
-        return 0
- 
-    def readinto(self, b):
-        try:
-            while len(self.leftover) < len(b):
-                chunk = next(self.gen)
-                self.leftover += chunk
-        except StopIteration:
-            pass
- 
-        output, self.leftover = self.leftover[:len(b)], self.leftover[len(b):]
-        b[:len(output)] = output
-        return len(output)
- 
- 
-def stream_parquet_to_tsv_gz(parquet_path: str):
-    """Generator streaming TSV.GZ chunks directly from disk without stream corruption."""
-    parquet_file = pq.ParquetFile(parquet_path)
- 
-    # Custom buffer to capture written gzip bytes incrementally
-    class ChunkBuffer(io.RawIOBase):
-        def __init__(self):
-            self.chunks = []
-        def writable(self):
-            return True
-        def write(self, b):
-            self.chunks.append(bytes(b))
-            return len(b)
-        def get_and_clear(self):
-            data = b"".join(self.chunks)
-            self.chunks.clear()
-            return data
- 
-    out_buf = ChunkBuffer()
- 
-    with gzip.GzipFile(fileobj=out_buf, mode="wb") as gz_file:
-        for record_batch in parquet_file.iter_batches(batch_size=5000):
-            df_chunk = record_batch.to_pandas()
-            tsv_data = df_chunk.to_csv(sep="\t", index=False, header=False).encode('utf-8')
-            gz_file.write(tsv_data)
-            gz_file.flush()
- 
-            chunk_data = out_buf.get_and_clear()
-            if chunk_data:
-                yield chunk_data
- 
-    # Yield remaining bytes (including gzip trailer) after closing
-    final_data = out_buf.get_and_clear()
-    if final_data:
-        yield final_data
- 
-# # # # # # # # # # # # # # # #
-# SURVIVAL / TIME-TO-EVENT # # #
-# # # # # # # # # # # # # # # #
-#
-# GEO characteristics fields are free text entered by submitters, so a
-# "time to event" column frequently contains things like "36+", "36 months",
-# ">60", "3.5 yrs", or "unknown" instead of a clean integer. The helpers
-# below extract the first embedded number from such strings rather than
-# failing or silently coercing to NaN for anything that isn't already a
-# clean int, and attempt to auto-detect common binary event vocabularies
-# (alive/dead, yes/no, 0/1) so the user isn't forced to manually map values
-# that are already unambiguous.
+def get_txt_gz_stream(parquet_path: str):
+    temp_dir = tempfile.gettempdir()
+    output_path = os.path.join(temp_dir, "export.txt.gz")
+    
+    duckdb.execute(f"""
+        COPY (SELECT * FROM '{parquet_path}') 
+        TO '{output_path}' 
+        (FORMAT 'CSV', DELIMITER '\t', HEADER TRUE, COMPRESSION 'GZIP');
+    """)
+    
+    with open(output_path, "rb") as f:
+        data = f.read()
+        
+    if os.path.exists(output_path):
+        os.remove(output_path)
+        
+    return data
+
  
 _NUMERIC_EXTRACT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
  
 def _extract_numeric(value) -> float:
-    """
-    Pull the first embedded number out of a messy clinical field, e.g.
-    '36+' -> 36.0, '36 months' -> 36.0, '>60' -> 60.0, '3.5 yrs' -> 3.5,
-    'unknown'/'' -> NaN.
-    """
     if pd.isna(value):
         return float("nan")
     s = str(value).strip()
@@ -1357,12 +1289,6 @@ _DEATH_WORDS = {"1", "1.0", "dead", "deceased", "died", "death", "event", "yes",
 _ALIVE_WORDS = {"0", "0.0", "alive", "living", "censored", "no", "false", "no event"}
  
 def _auto_binary_map(unique_vals) -> Optional[dict]:
-    """
-    Try to confidently auto-map an event column to 0/1 without asking the
-    user, covering numeric-as-string ('0','1','0.0') and common clinical
-    vocabulary ('alive'/'dead', 'yes'/'no', ...). Returns None if any value
-    isn't recognized, so the caller falls back to manual radio buttons.
-    """
     cleaned = {}
     for v in unique_vals:
         s = str(v).strip().lower()
@@ -1463,107 +1389,266 @@ def survival_metadata_ui(char_df):
             mime="text/plain",
         )
 
-@st.fragment
-def qc(i, char_df, gse_id, source_path, modified_path):
+import os
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import pyarrow.parquet as pq
+import pyarrow.types as pt
+import streamlit as st
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
+
+MAX_ROWS_FOR_QC = 5000
+SILHOUETTE_WARNING = 0.5
+
+
+def _load_numeric(source_path):
+    schema = pq.read_schema(source_path)
+    numeric_cols = [
+        f.name for f in schema
+        if pt.is_integer(f.type) or pt.is_floating(f.type)
+    ]
+    return pq.read_table(source_path, columns=numeric_cols).to_pandas().astype(np.float32)
+
+
+def _factor_labels(char_df, col, samples):
+    lookup = char_df[col]
+    lookup = lookup[~lookup.index.duplicated(keep="first")]
+    return pd.Series(samples, index=samples).map(lookup).fillna("NA").astype(str)
+
+
+@st.cache_data(show_spinner="PCA and RLE Loading")
+def compute_microarray_qc(source_path, char_df, raw = False):
+    source_df = _load_numeric(source_path)
+    if raw:
+            source_df = source_df[(source_df >= 10).sum(axis=1) >= 3]          
+            cpm = source_df / source_df.sum(axis=0) * 1e6           
+            logcpm = np.log2(cpm + 1)                               
+            top = logcpm.var(axis=1).nlargest(1000).index 
+            X = logcpm.loc[top].T
+
+    if source_df.max().max() > 100: 
+        source_df = np.log2(source_df.clip(lower=0) + 1)
+
+        st.warning("Existing data was likely linearly scaled, so for PCA and RLE purposes it has been log scaled.")
+
+    if not raw:
+        X = source_df.T
+        X = X.fillna(X.mean()).dropna(axis=1)
+
+    pca = PCA(n_components=2, svd_solver="randomized", random_state=0)
+    pcs = pca.fit_transform(X)
+    pca_base = pd.DataFrame(pcs, columns=["PC1", "PC2"], index=X.index)
+    pca_base["Sample"] = pca_base.index
+    var_explained = pca.explained_variance_ratio_ * 100
+
+    if len(source_df) > MAX_ROWS_FOR_QC:
+        source_df = source_df.sample(MAX_ROWS_FOR_QC, random_state=0)
+    deviation_df = source_df.sub(source_df.median(axis=1), axis=0)
+    box_df = deviation_df.melt(var_name="Sample", value_name="Deviation")
+
+    silhouettes = {}
+    for col in char_df.columns:
+        labels = _factor_labels(char_df, col, pca_base["Sample"])
+        if 1 < labels.nunique() < len(labels):
+            silhouettes[col] = silhouette_score(pcs, labels)
+
+    return pca_base, var_explained, box_df, silhouettes
+
+
+@st.cache_data(show_spinner="Sequencing Depth Loading ")
+def compute_depth(source_path):
+    source_df = _load_numeric(source_path)
+    return pd.DataFrame({"Sample": source_df.columns, "Depth": source_df.sum(axis=0).values})
+
+
+def qc(char_df, gse_id, source_path, modified_path, normalization_type):
     with st.expander("Quality Control", expanded=False):
-        st.session_state[f"selected_columns_for_download_{i}"] = column_selector(modified_path, i, gse_id, "qc")
+        st.session_state[f"selected_columns_for_download"] = column_selector(
+            modified_path, i, gse_id, "qc"
+        )
+        selected = set(st.session_state[f"selected_columns_for_download"])
+
         if "microarray" in str(source_path):
+            pca_base, var_explained, box_df, silhouettes = compute_microarray_qc(
+                str(source_path), char_df
+            )
+
+            best_col = max(silhouettes, key=silhouettes.get) if silhouettes else char_df.columns[0]
+
+            st.markdown(
+                "#### Sample PCA\n"
+                "Each point is one sample. Samples with similar gene expression sit close together. "
+                "Use this to spot **outliers** (points far from everything else) that may be bad "
+                "samples worth removing."
+            )
             color_col = st.selectbox(
-                "Varied Factor",
+                "Varied Factor (color the samples by...)",
                 char_df.columns,
-                key = f"qc_rle_selector_{i}"
+                list(char_df.columns).index(best_col),
+                key=f"qc_rle_selector",
+                help="Defaults to the factor that best separates samples on the PCA.",
             )
 
-            schema = pq.read_schema(source_path)
-            numeric_cols = [
-                f.name for f in schema
-                if pt.is_integer(f.type) or pt.is_floating(f.type)
-            ]
-            source_df = pq.read_table(source_path, columns=numeric_cols).to_pandas()
-
-            source_df = source_df.astype(np.float32)
-
-            row_medians = source_df.median(axis=1)
-            deviation_df = source_df.sub(row_medians, axis=0)
-
-            MAX_ROWS_FOR_QC = 5000
-            if len(deviation_df) > MAX_ROWS_FOR_QC:
-                deviation_df = deviation_df.sample(MAX_ROWS_FOR_QC, random_state=0)
-
-            box_df = deviation_df.melt(var_name="Sample", value_name="Deviation")
-
-            X = source_df.T.fillna(source_df.T.mean())  # samples as rows, genes as columns
-            pca = PCA(n_components=2)
-            pcs = pca.fit_transform(X)
-
-            pca_df = pd.DataFrame(
-                pcs,
-                columns=["PC1", "PC2"],
-                index=X.index,  
+            pca_df = pca_base.copy()
+            pca_df[color_col] = _factor_labels(char_df, color_col, pca_df["Sample"]).values
+            pca_df["Status"] = np.where(
+                pca_df["Sample"].isin(selected), "Kept", "Removed"
             )
-            pca_df["Sample"] = pca_df.index
-            pca_df["Selected"] = np.where(
-                pca_df["Sample"].isin(st.session_state[f"selected_columns_for_download_{i}"]),
-                "yes",
-                "no",
-            )
-            color_lookup = char_df[color_col]
-            color_lookup = color_lookup[~color_lookup.index.duplicated(keep="first")]
-            pca_df[color_col] = pca_df["Sample"].map(color_lookup)
 
-            var_explained = pca.explained_variance_ratio_ * 100
+            score = silhouettes.get(color_col)
+            if score is not None and score > SILHOUETTE_WARNING:
+                st.warning(
+                    f"Samples separate very strongly by **{color_col}** "
+                    f"(silhouette score = {score:.2f}). If this factor is not a real biological "
+                    "difference (e.g. a processing date, platform, or lab), there is a strong "
+                    "potential for **batch effects**. Consider correcting for it before "
+                    "comparing groups."
+                )
+
+            n_removed = int((pca_df["Status"] == "Removed").sum())
+            st.caption(
+                f"Circle = sample kept (will be in your download)   |   "
+                f"X = sample removed (excluded from your download)   |   "
+                f"{len(pca_df) - n_removed} kept, {n_removed} removed"
+                + (f"   |   Silhouette for '{color_col}': {score:.2f} "
+                   "(-1 to 1; higher = groups are more distinct)" if score is not None else "")
+            )
+
 
             pca_fig = px.scatter(
                 pca_df,
                 x="PC1",
                 y="PC2",
                 color=color_col,
-                symbol = "Selected",
-                symbol_map={"yes": "circle", "no": "triangle-up"},
+                symbol="Status",
+                symbol_map={"Kept": "circle", "Removed": "x"},
                 hover_name="Sample",
                 labels={
-                    "PC1": f"PC1 ({var_explained[0]:.1f}% variance)",
-                    "PC2": f"PC2 ({var_explained[1]:.1f}% variance)",
+                    "PC1": f"PC1 ({var_explained[0]:.1f}% of variance)",
+                    "PC2": f"PC2 ({var_explained[1]:.1f}% of variance)",
                 },
                 title="Sample PCA",
             )
             pca_fig.update_traces(marker=dict(size=10))
-            st.plotly_chart(pca_fig)
+            st.plotly_chart(pca_fig, key=f"qc_pca")
 
-            box_df[color_col] = box_df["Sample"].map(color_lookup)
-            box_df = box_df.sort_values(by = color_col)
-
-            fig = px.box(box_df, x="Sample", y="Deviation", color=color_col, points = False)
-            st.plotly_chart(fig, key = f"qc_plot_{i}")
-
-            corr_matrix = source_df.corr()  # samples x samples
-            corr_fig = px.imshow(corr_matrix, color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
-            st.plotly_chart(corr_fig, key = f"qc_plot_corr_{i}")
-        else:
-            schema = pq.read_schema(source_path)
-            numeric_cols = [
-                f.name for f in schema
-                if pt.is_integer(f.type) or pt.is_floating(f.type)
-            ]
-
-            source_df = pq.read_table(source_path, columns=numeric_cols).to_pandas()
-
-            source_df = source_df.astype(np.float32)
-
-            depth_df = pd.DataFrame()
-            depth_df['Sample'] = source_df.columns
-            
-
-            depth_df['Depth'] = depth_df["Sample"].map(source_df.sum(axis = 0))
-
-            fig = px.bar(depth_df, x = "Sample", y = "Depth")
-            fig.add_hline(
-                y=20e6, 
-                line_dash="dash", 
-                line_color="black", 
+            st.markdown(
+                "#### Relative Log Expression (RLE)\n"
+                "Each box shows how far one sample's genes deviate from the typical (median) "
+                "gene value of each gene in the sample. In a healthy dataset, boxes are **centered near 0 and roughly the "
+                "same height**. A box that is shifted up/down or much wider than the rest may "
+                "be a low-quality sample or a batch difference."
             )
+            box_df = box_df.copy()
+            box_df[color_col] = box_df["Sample"].map(
+                dict(zip(pca_df["Sample"], pca_df[color_col]))
+            )
+            box_df = box_df.sort_values(by=color_col)
+
+            fig = px.box(box_df, x="Sample", y="Deviation", color=color_col, points=False)
+            st.plotly_chart(fig, key=f"qc_plot")
+
+        else:
+            if normalization_type == "raw_counts":
+                pca_base, var_explained, box_df, silhouettes = compute_microarray_qc(
+                    str(source_path), char_df, raw=True
+                )
+            else:
+                pca_base, var_explained, box_df, silhouettes = compute_microarray_qc(
+                    str(source_path), char_df, raw=True
+                )
+
+            best_col = max(silhouettes, key=silhouettes.get) if silhouettes else char_df.columns[0]
+
+            st.markdown(
+                "#### Sample PCA\n"
+                "Each point is one sample. Samples with similar gene expression sit close together. "
+                "Use this to spot **outliers** (points far from everything else) that may be bad "
+                "samples worth removing."
+            )
+            color_col = st.selectbox(
+                "Varied Factor (color the samples by...)",
+                char_df.columns,
+                list(char_df.columns).index(best_col),
+                key=f"qc_rle_selector",
+                help="Defaults to the factor that best separates samples on the PCA.",
+            )
+
+            pca_df = pca_base.copy()
+            pca_df[color_col] = _factor_labels(char_df, color_col, pca_df["Sample"]).values
+            pca_df["Status"] = np.where(
+                pca_df["Sample"].isin(selected), "Kept", "Removed"
+            )
+
+            score = silhouettes.get(color_col)
+            if score is not None and score > SILHOUETTE_WARNING:
+                st.warning(
+                    f"Samples separate very strongly by **{color_col}** "
+                    f"(silhouette score = {score:.2f}). If this factor is not a real biological "
+                    "difference (e.g. a processing date, platform, or lab), there is a strong "
+                    "potential for **batch effects**. Consider correcting for it before "
+                    "comparing groups."
+                )
+
+            n_removed = int((pca_df["Status"] == "Removed").sum())
+            st.caption(
+                f"Circle = sample kept (will be in your download)   |   "
+                f"X = sample removed (excluded from your download)   |   "
+                f"{len(pca_df) - n_removed} kept, {n_removed} removed"
+                + (f"   |   Silhouette for '{color_col}': {score:.2f} "
+                   "(-1 to 1; higher = groups are more distinct)" if score is not None else "")
+            )
+
+
+            pca_fig = px.scatter(
+                pca_df,
+                x="PC1",
+                y="PC2",
+                color=color_col,
+                symbol="Status",
+                symbol_map={"Kept": "circle", "Removed": "x"},
+                hover_name="Sample",
+                labels={
+                    "PC1": f"PC1 ({var_explained[0]:.1f}% of variance)",
+                    "PC2": f"PC2 ({var_explained[1]:.1f}% of variance)",
+                },
+                title="Sample PCA",
+            )
+            pca_fig.update_traces(marker=dict(size=10))
+            st.plotly_chart(pca_fig, key=f"qc_pca")
+
             
-            st.plotly_chart(fig, key = f"qc_plot_{i}")
+
+            if normalization_type == "raw_counts":
+                depth_df = compute_depth(str(source_path))
+                depth_df["Status"] = np.where(
+                    depth_df["Sample"].isin(selected), "Kept", "Removed"
+                )
+                st.markdown(
+                    "#### Sequencing Depth\n"
+                    "Total reads per sample. Samples below the dashed line (20 million reads) have "
+                    "less data, so their gene measurements are noisier and less reliable. "
+                    "Works only for raw counts."
+                )
+                fig = px.bar(
+                    depth_df, x="Sample", y="Depth",
+                    labels={"Depth": "Total reads"},
+                    color = "Status",
+                    color_discrete_map = {
+                            "Kept": "blue",      
+                            "Removed": "yellow"      
+                        }
+
+                )
+                fig.add_hline(
+                    y=20e6,
+                    line_dash="dash",
+                    line_color="black",
+                    annotation_text="20M reads",
+                )
+                st.plotly_chart(fig, key=f"qc_plot")
 
         
 
@@ -1783,16 +1868,55 @@ def apply_norm(modified_path, norm, col_list, i, source_path):
  
 if "result_lists" not in st.session_state:
     st.session_state.result_lists = None
- 
-if st.button("Fetch & Build Matrix", type="primary"):
-    st.session_state.run_pipeline = True
-    st.session_state.result_lists = None
- 
-    for key in list(st.session_state.keys()):
-        if str(key).startswith(("df_", "base_df_", "norm_type_", "preview_", "selected_cols_dict_", "pill_selector_")):
-            del st.session_state[key]
-    gc.collect()
- 
+
+@st.dialog("Download Data", width="large")
+def download_dialog():
+    if st.session_state.result_lists is not None:
+        result_lists = st.session_state.result_lists
+        max_workers = min(4, len(result_lists))
+        current_norms = []
+        for i in range(len(result_lists)):
+            current_norms.append(st.session_state.get(f"norm_type_{i}", "none"))
+        def prep_download(i, meta_entry):
+            current_norm = current_norms[i]
+            norm_suffix = f"_{current_norm}" if current_norm != "none" else ""
+            return (f"download_{i}", get_txt_gz_stream(meta_entry["modified_path"]), f"{gse_id}_{meta_entry['normalization_type']}{norm_suffix}.txt.gz")
+
+
+        for i, meta_entry in enumerate(result_lists):
+            res = prep_download(i, meta_entry)
+            if res is not None:
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.write(meta_entry["modified_path"])
+                with c2:
+                    st.download_button(
+                        label="⬇",
+                        key=res[0],
+                        data=res[1],
+                        file_name=res[2],
+                        mime="application/gzip",
+                    )
+
+
+    else:
+        st.info("No results available yet.")
+
+c1, c2 = st.columns(2)
+with c1:
+    if st.button("Fetch & Build Matrix", type="primary"):
+        st.session_state.run_pipeline = True
+        st.session_state.result_lists = None
+    
+        for key in list(st.session_state.keys()):
+            if str(key).startswith(("df_", "base_df_", "norm_type_", "preview_", "selected_cols_dict_", "pill_selector_")):
+                del st.session_state[key]
+        gc.collect()
+with c2:
+    if st.button("Download Data", type = "primary"):
+        download_dialog()
+
+        
  
 if st.session_state.run_pipeline and st.session_state.result_lists is None:
  
@@ -1826,6 +1950,15 @@ if st.session_state.result_lists is not None:
         gsm_filter.extend(meta["gsm_gpl_dict"][g])
  
     survival_metadata_ui(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")])
+
+
+    qc_meta_entry = result_lists[0]
+
+    for i, meta_entry in enumerate(result_lists):
+        if meta_entry["normalization_type"] == "raw_counts":
+            qc_meta_entry = meta_entry
+
+    qc(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, qc_meta_entry["path"], qc_meta_entry["modified_path"], qc_meta_entry["normalization_type"])
     st.markdown("""
         <style>
             .normalization {
@@ -1876,7 +2009,7 @@ if st.session_state.result_lists is not None:
         c1.metric("Genes", f"{n_genes:,}")
         c2.metric("Samples", len(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")]))
 
-        qc(i, char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, meta_entry["path"], meta_entry["modified_path"])
+        
         annotate_columns(i, char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, meta_entry["path"], meta_entry["modified_path"])
  
         with st.expander("Change Normalization", expanded=False):
@@ -1964,10 +2097,10 @@ if st.session_state.result_lists is not None:
         current_norm = st.session_state.get(f"norm_type_{i}", "none")
         norm_suffix = f"_{current_norm}" if current_norm != "none" else ""
  
-        st.download_button(
-            label="⬇ Download complete matrix (.txt.gz)",
-            key=f"download_{i}",
-            data=StreamWrapper(stream_parquet_to_tsv_gz(meta_entry["modified_path"])),
-            file_name=f"{gse_id}_{original_normalization}{norm_suffix}.txt.gz",
-            mime="application/gzip",
-        )
+        # st.download_button(
+        #     label="⬇ Download complete matrix (.txt.gz)",
+        #     key=f"download_{i}",
+        #     data=StreamWrapper(stream_parquet_to_tsv_gz(meta_entry["modified_path"])),
+        #     file_name=f"{gse_id}_{original_normalization}{norm_suffix}.txt.gz",
+        #     mime="application/gzip",
+        # )
