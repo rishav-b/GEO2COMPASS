@@ -16,6 +16,8 @@ from urllib.request import Request, urlopen
 import plotly.express as px
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
+import uuid
+from datetime import datetime, timezone
  
 # PyArrow 25.0.0 can segfault when Streamlit initializes Arrow from a
 # ScriptRunner thread. Use the system allocator even if the deployment
@@ -88,6 +90,20 @@ if "dp_text" not in st.session_state:
     st.session_state.dp_text = ""
 if "char_df" not in st.session_state:
     st.session_state.char_df = pd.DataFrame()
+if "record_log" not in st.session_state:
+    st.session_state.log_record = []
+
+def log_record(category, message, **details):
+    if "record_log" not in st.session_state:
+        st.session_state.record_log = []
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "category": category,
+        "message": message,
+    }
+    if details:
+        entry["details"] = details
+    st.session_state.record_log.append(entry)
  
 def fetch_metadata(gse_id: str, gse) -> dict:
     try:
@@ -195,10 +211,17 @@ def get_dp_and_char(gse, meta):
     first_gsm = gse.gsms[meta["gsm_ids"][0]]
     dp_text = first_gsm.metadata.get("data_processing", [""])[0]
     st.session_state["dp_text"] = dp_text
-    char_list = list(dict.fromkeys(
-        x.split(": ", 1)[0]
-        for x in first_gsm.metadata.get("characteristics_ch1", [])
-    ))
+    char_list = set()
+    for gsm in meta["gsm_ids"]:
+        gsm_data = gse.gsms[gsm]
+        for x in gsm_data.metadata.get("characteristics_ch1", []):
+            if ": " in x:
+                char_list.add(x.split(": ", 1)[0])
+            else:
+                char_list.add(x)
+
+    char_list = list(char_list)
+
     char_df = pd.DataFrame(columns=char_list)
     for gsm in meta["gsm_ids"]:
         gsm_data = gse.gsms[gsm]
@@ -424,6 +447,12 @@ def too_homogenous(col):
  
     col = list(set(col))
     return len(col) < 100
+
+HGNC_URL = "https://storage.googleapis.com/public-download-files/hgnc/tsv/tsv/hgnc_complete_set.txt"
+
+def fetch_hgnc_table() -> pd.DataFrame:
+    df = pd.read_csv(HGNC_URL, sep="\t", dtype=str, low_memory=False)
+    return df[["hgnc_id", "symbol", "prev_symbol", "alias_symbol"]]
  
 def gene_convert(gpl_df, gse, best_col, symbol_col):
     for gpl_name, gpl in getattr(gse, "gpls", {}).items():
@@ -455,8 +484,11 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
     if numeric_namespace == None:
         return gpl_df, symbol_col
     else:
-        gpl_df["new_id_col"] = gpl_df[best_col].astype(str).str.replace(r"_at$", "", regex=True)
-        gpl_df["new_id_col"] = gpl_df[best_col].astype(str).str.replace(r"\.\d+$", "", regex=True)
+        gpl_df["new_id_col"] = (
+            gpl_df[best_col].astype(str)
+            .str.replace(r"_at$", "", regex=True)
+            .str.replace(r"\.\d+$", "", regex=True)
+        )
         if (str(gpl_df[best_col].iloc[0]).strip()[:3].lower() == "eg:"):
             gpl_df["new_id_col"] = gpl_df[best_col].astype(str).str.split(':').str[1]
  
@@ -465,16 +497,30 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
             results = gp.convert(organism=species, query=list(gpl_df["new_id_col"]),
                                 numeric_namespace=numeric_namespace, target_namespace=target_namespace)
             if results.empty or "name" not in results.columns:
-                #st.warning("Gene symbol conversion returned no results; keeping original IDs.")
+                log_record(
+                    "gene_annotation", "g:Profiler conversion returned no results; original IDs kept.",
+                    species=species, numeric_namespace=numeric_namespace, target_namespace=target_namespace,
+                )
                 return gpl_df, symbol_col
         except Exception as e:
-            #st.warning(f"Gene symbol conversion failed ({e}); keeping original IDs.")
+            log_record(
+                "gene_annotation", "g:Profiler conversion failed; original IDs kept.",
+                error=str(e), species=species,
+            )
             return gpl_df, symbol_col
  
         results_deduped = results.drop_duplicates(subset="incoming", keep="first")
         mapping = results_deduped.set_index("incoming")["name"]
  
         gpl_df["gene_symbol"] = [mapping.get(id_, float("nan")) for id_ in gpl_df["new_id_col"]]
+
+        mapped_count = int(gpl_df["gene_symbol"].notna().sum())
+        log_record(
+            "gene_annotation", "Gene symbols assigned via g:Profiler conversion.",
+            species=species, numeric_namespace=numeric_namespace, target_namespace=target_namespace,
+            mapped=mapped_count, total=len(gpl_df),
+            mapping_rate=round(mapped_count / len(gpl_df), 3) if len(gpl_df) else 0,
+        )
  
         return gpl_df, "gene_symbol"
  
@@ -508,6 +554,12 @@ def select_gpl(results):
     print(len(intersection) / len(union))
  
     if len(intersection) / len(union) > 0.65:
+        log_record(
+            "gpl_selection",
+            "Platforms merged automatically (gene sets sufficiently overlapping).",
+            overlap_ratio=round(len(intersection) / len(union), 3),
+            gpl_ids=list(results.keys()),
+        )
         return results
     else:
         if len(meta["gpl_ids"]) > 1:
@@ -525,6 +577,13 @@ def select_gpl(results):
                 selected_gpl = selected_gpl.split(":  ")[0]
                 meta['gsm_ids'] = meta["gsm_gpl_dict"][selected_gpl]
                 meta['gpl_ids'] = [selected_gpl]
+                log_record(
+                    "gpl_selection",
+                    "User selected a single platform; platforms were not merged.",
+                    overlap_ratio=round(len(intersection) / len(union), 3),
+                    selected_gpl=selected_gpl,
+                    available_gpls=meta["gpl_ids"],
+                )
             else:
                 st.info("Select one platform before building the matrix.")
                 st.stop()
@@ -1076,6 +1135,11 @@ def fetch_and_normalize(
         if c.normalization == "unknown":
             c.normalization = dp_norm_info.norm_type
             c.is_log = dp_norm_info.is_log
+        
+        log_record(
+            "normalization", "Normalization detected from source metadata.",
+            norm_type=c.normalization, is_log=c.is_log
+        )
  
         print(f"\n  Processing: {c.filename}")
  
@@ -1216,6 +1280,10 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
     after = len(df)
     if before != after:
         print(f"dropped {before - after} unmapped rows ({after} remaining)")
+        log_record(
+            "gene_annotation", "Probes with no gene symbol mapping were dropped.",
+            dropped=before - after, remaining=after,
+        )
  
     df = df.drop("_probe_id", axis=1)
     print(f"Remapped across {len(results)} GPL platform(s)")
@@ -1226,6 +1294,11 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
 def fetch_microarray_matrix(meta: dict):
     dp_text = st.session_state["dp_text"]
     norm_info = detect_normalization(dp_text=dp_text)
+
+    log_record(
+        "normalization", "Normalization detected from source metadata.",
+        norm_type=norm_info.norm_type, is_log=norm_info.is_log, source=norm_info.source,
+    )
  
     final_df = GLOBAL_GSE.pivot_samples(values="VALUE")[meta["gsm_ids"]]
  
@@ -1255,22 +1328,31 @@ def fetch_microarray_matrix(meta: dict):
     return [meta_entry]
  
  
-def get_txt_gz_stream(parquet_path: str):
+def get_txt_gz_stream(parquet_path: str, columns):
     temp_dir = tempfile.gettempdir()
-    output_path = os.path.join(temp_dir, "export.txt.gz")
-    
+    output_path = os.path.join(temp_dir, f"export_{uuid.uuid4().hex}.txt.gz")
+
+    if columns:
+        if "Name" not in columns:
+            columns = ["Name"] + columns
+        cols_sql = ", ".join(f'"{c}"' for c in columns)
+        select_clause = f"SELECT {cols_sql} FROM '{parquet_path}'"
+    else:
+        select_clause = f"SELECT * FROM '{parquet_path}'"
+
     duckdb.execute(f"""
-        COPY (SELECT * FROM '{parquet_path}') 
-        TO '{output_path}' 
+        COPY ({select_clause})
+        TO '{output_path}'
         (FORMAT 'CSV', DELIMITER '\t', HEADER TRUE, COMPRESSION 'GZIP');
     """)
-    
-    with open(output_path, "rb") as f:
-        data = f.read()
-        
-    if os.path.exists(output_path):
-        os.remove(output_path)
-        
+
+    try:
+        with open(output_path, "rb") as f:
+            data = f.read()
+    finally:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
     return data
 
  
@@ -1463,12 +1545,17 @@ def compute_depth(source_path):
     return pd.DataFrame({"Sample": source_df.columns, "Depth": source_df.sum(axis=0).values})
 
 
+
+
 def qc(char_df, gse_id, source_path, modified_path, normalization_type):
     with st.expander("Quality Control", expanded=False):
-        st.session_state[f"selected_columns_for_download"] = column_selector(
-            modified_path, i, gse_id, "qc"
+        selected_columns = column_selector(
+            modified_path, "qc_panel", gse_id, "qc", str(modified_path)
         )
-        selected = set(st.session_state[f"selected_columns_for_download"])
+        st.session_state["selected_columns_for_download"] = selected_columns
+        selected = set(selected_columns)
+
+        depth_df = None
 
         if "microarray" in str(source_path):
             pca_base, var_explained, box_df, silhouettes = compute_microarray_qc(
@@ -1549,6 +1636,22 @@ def qc(char_df, gse_id, source_path, modified_path, normalization_type):
 
             fig = px.box(box_df, x="Sample", y="Deviation", color=color_col, points=False)
             st.plotly_chart(fig, key=f"qc_plot")
+
+            qc_summary_df = pca_df[["Sample", color_col, "Status"]].rename(
+                columns={color_col: "colored_by"}
+            )
+            if normalization_type == "raw_counts" and depth_df is not None:
+                qc_summary_df = qc_summary_df.merge(
+                    depth_df[["Sample", "Depth"]], on="Sample", how="left"
+                )
+
+            st.download_button(
+                label="⬇ Download QC summary (.csv)",
+                data=qc_summary_df.to_csv(index=False),
+                file_name=f"{gse_id}_qc_summary.csv",
+                mime="text/csv",
+                key="download_qc_summary",
+            )
 
         else:
             if normalization_type == "raw_counts":
@@ -1690,6 +1793,11 @@ def annotate_columns(i, char_df, gse_id, source_path, modified_path):
             ]
  
             modified_df = modified_df.rename_columns(new_column_names)
+
+            log_record(
+                "sample_annotation", "GSM column names replaced with characteristic-derived names.",
+                fields_used=current_selection or "GSM ID only",
+            )
  
  
             pq.write_table(
@@ -1703,11 +1811,11 @@ def annotate_columns(i, char_df, gse_id, source_path, modified_path):
             st.rerun(scope="app")
  
 @st.fragment
-def column_selector(counts_path, i, gse_id, suffix):
+def column_selector(counts_path, i, gse_id, state, suffix):
     parquet_file = pq.ParquetFile(counts_path)
     all_columns = parquet_file.schema.names
  
-    state_key = f"selected_cols_dict_{gse_id}_{i}_{suffix}"
+    state_key = f"selected_cols_dict_{gse_id}_{state}_{suffix}"
     if state_key not in st.session_state:
         st.session_state[state_key] = {col: True for col in all_columns}
  
@@ -1873,30 +1981,93 @@ if "result_lists" not in st.session_state:
 def download_dialog():
     if st.session_state.result_lists is not None:
         result_lists = st.session_state.result_lists
-        max_workers = min(4, len(result_lists))
         current_norms = []
         for i in range(len(result_lists)):
             current_norms.append(st.session_state.get(f"norm_type_{i}", "none"))
-        def prep_download(i, meta_entry):
+        def prep_download(i, meta_entry, columns = None):
             current_norm = current_norms[i]
             norm_suffix = f"_{current_norm}" if current_norm != "none" else ""
-            return (f"download_{i}", get_txt_gz_stream(meta_entry["modified_path"]), f"{gse_id}_{meta_entry['normalization_type']}{norm_suffix}.txt.gz")
+            return (f"download_{i}", get_txt_gz_stream((meta_entry["modified_path"]), 
+                                                        columns = columns), f"{gse_id}_{meta_entry['normalization_type']}{norm_suffix}.txt.gz")
 
-
+        select_dict = {}
         for i, meta_entry in enumerate(result_lists):
-            res = prep_download(i, meta_entry)
-            if res is not None:
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    st.write(meta_entry["modified_path"])
-                with c2:
-                    st.download_button(
-                        label="⬇",
-                        key=res[0],
-                        data=res[1],
-                        file_name=res[2],
-                        mime="application/gzip",
+            select_dict[meta_entry["modified_path"]] = (i, meta_entry)
+
+        selected_path = st.selectbox(
+            "Which dataset would you like to download?",
+            options = [x["modified_path"] for x in result_lists],
+            key = "selected_path_for_download"
+        )
+
+        selected_columns = column_selector(
+            selected_path, "download", gse_id, "qc", selected_path
+        )
+
+        res = prep_download(select_dict[st.session_state["selected_path_for_download"]][0], select_dict[st.session_state["selected_path_for_download"]][1],
+                            columns = selected_columns)
+        if res is not None:
+            signature = st.text_area(
+                "Paste signature to check availability (any punctuation okay)"
+            )
+
+            signature_list = re.split(r'[;,\s]', signature)
+
+            signature_set = set([s.strip() for s in signature_list if s.strip()])
+
+
+            if signature_set:
+                hngc_data = fetch_hgnc_table()
+                df = pq.read_table(meta_entry["modified_path"], columns=["Name"]).to_pandas()
+                available_genes = set(df["Name"].dropna().unique())
+                print(list(available_genes)[:10])
+
+                signature_set_symbol = signature_set.intersection(set(hngc_data["symbol"].dropna().unique()))
+                signature_set_alias = signature_set.intersection(set(hngc_data["alias_symbol"].dropna().unique()))
+                signature_set_prev = signature_set.intersection(set(hngc_data["prev_symbol"].dropna().unique()))
+                missing_genes_symbol = signature_set_symbol - available_genes
+                missing_genes_alias = signature_set_alias - available_genes
+                missing_genes_prev = signature_set_prev - available_genes
+
+                print(missing_genes_symbol.intersection(missing_genes_alias).intersection(missing_genes_prev))
+
+                if intersection := missing_genes_symbol.intersection(missing_genes_alias).intersection(missing_genes_prev):
+                    
+                    st.warning(
+                        f"{len(intersection)} gene(s) from your signature were not found in this dataset: "
+                        + ", ".join(list(intersection)[:10]) + ("..." if len(intersection) > 10 else "")
                     )
+
+                    log_record(
+                        "signature_check", "User checked signature against dataset.",
+                        missing_genes=list(intersection),
+                    )
+                else:
+                    st.success("All genes from your signature are present in this dataset.")
+
+
+            st.download_button(
+                label="⬇",
+                key=res[0],
+                data=res[1],
+                file_name=res[2],
+                mime="application/gzip",
+            )
+
+        if st.session_state.get("provenance_log"):
+            record_payload = {
+                "gse_id": gse_id,
+                "accessed": datetime.now(timezone.utc).isoformat(),
+                "tool_version": "geo-2-compass-0.1", 
+                "events": st.session_state.provenance_log,
+            }
+            st.download_button(
+                label="⬇ Download provenance log (.json)",
+                data=json.dumps(record_payload, indent=2, default=str),
+                file_name=f"{gse_id}_provenance.json",
+                mime="application/json",
+                key="download_provenance",
+            )
 
 
     else:
@@ -2030,7 +2201,7 @@ if st.session_state.result_lists is not None:
             )
  
             st.write("Which columns would you like to apply it to?")
-            st.session_state[f"selected_columns_{i}"] = column_selector(meta_entry["modified_path"], i, gse_id, "annotator")
+            st.session_state[f"selected_columns_{i}"] = column_selector(meta_entry["modified_path"], i, gse_id, "annotator", str(meta_entry["modified_path"]) + "&")
  
             submit_button = st.button(label="Renormalize", key=f"renormalize_{i}")
  
@@ -2041,6 +2212,13 @@ if st.session_state.result_lists is not None:
                     st.session_state[f"selected_columns_{i}"],
                     i,
                     meta_entry["path"]
+                )
+
+                log_record(
+                    "normalization", "User applied a renormalization.",
+                    applied=st.session_state[f"norm_type_{i}"],
+                    original=original_normalization,
+                    n_columns=len(st.session_state[f"selected_columns_{i}"]),
                 )
  
                 pq.write_table(
