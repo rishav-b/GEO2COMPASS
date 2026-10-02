@@ -18,11 +18,15 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
 import uuid
 from datetime import datetime, timezone
+from diskcache import Cache
  
 # PyArrow 25.0.0 can segfault when Streamlit initializes Arrow from a
 # ScriptRunner thread. Use the system allocator even if the deployment
 # environment does not define this variable .
 os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
+cache = Cache("./geo_cache", 
+              size_limit=2 * 1024**3,
+              eviction_policy="least-recently-used")
  
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -42,7 +46,7 @@ st.set_page_config(page_title="GEO-2-COMPASS")
 st.title("GEO-2-COMPASS")
  
 MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
-MAX_MATRIX_CELLS = 50_000_000
+MAX_MATRIX_CELLS = 150_000_000
 PREVIEW_ROWS = 1_000
 PREVIEW_COLUMNS = 150
  
@@ -91,7 +95,7 @@ if "dp_text" not in st.session_state:
 if "char_df" not in st.session_state:
     st.session_state.char_df = pd.DataFrame()
 if "record_log" not in st.session_state:
-    st.session_state.log_record = []
+    st.session_state.record_log = []
 
 def log_record(category, message, **details):
     if "record_log" not in st.session_state:
@@ -183,17 +187,12 @@ def get_gse(gse_id):
  
             with tempfile.NamedTemporaryFile(
                 suffix=".soft.gz",
-                delete=False,  # Windows locks files opened with delete=True while the
-                               # handle is still open; GEOparse re-opening the same path
-                               # by name would otherwise raise PermissionError on Windows.
-            ) as temp_file:
+                delete=False,  ) as temp_file:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         temp_file.write(chunk)
                 temp_file.flush()
  
-            # The `with` block above has now closed the file handle, releasing any
-            # Windows file lock, so GEOparse can safely open the same path by name.
             try:
                 print("Parsing data with GEOparse from temporary file...")
                 return GEOparse.get_GEO(
@@ -230,7 +229,7 @@ def get_dp_and_char(gse, meta):
         for x in gsm_data.metadata.get("characteristics_ch1", []):
             if ": " in x:
                 key, value = x.split(": ", 1)
-                new_row[key] = value
+                new_row[key] = value          
             else:
                 new_row[x] = x
         if "characteristics_ch1" in gsm_data.metadata:
@@ -271,43 +270,17 @@ get_dp_and_char(GLOBAL_GSE, meta)
 # # # # # # # # # # # # # # # #
 # NORMALIZATION DETECTION # # #
 # # # # # # # # # # # # # # # #
-#
-# Rewritten from scratch to fix a real precision bug in the previous
-# implementation: the old code used an if/elif chain of `in` substring
-# checks, tested in a fixed order. That meant a file literally named
-# "GSE123_rsem_tpm.txt" was classified as "raw_counts" purely because
-# "rsem" happened to be tested before "tpm" in the chain, even though the
-# filename explicitly says the values are TPM-normalized. The same failure
-# mode applied to the free-text `data_processing` field.
-#
-# This version:
-#   1. Uses word-boundary-safe regex instead of raw substring matching, so
-#      it doesn't misfire on partial matches embedded in longer tokens.
-#   2. Scans for every keyword that appears anywhere in the text and picks
-#      whichever match occurs LAST in the string, since both GEO's
-#      data_processing prose and supplementary filenames tend to name the
-#      *final* processing step last (e.g. "aligned, counted, then
-#      TPM-normalized" or "..._rsem_tpm.txt").
-#   3. Separates "which normalization category" from "is it log-scaled"
-#      into two independently-resolved questions instead of conflating them
-#      into a single ad-hoc keyword list.
  
 @dataclass
 class NormInfo:
-    norm_type: str      # canonical short category, safe to show in a badge
+    norm_type: str     
     is_log: bool
-    matched_term: str    # the literal text that triggered the match (debugging aid)
-    source: str          # "data_processing_text" | "filename" | "default"
+    matched_term: str   
+    source: str 
  
-def _normalize_for_match(text: str) -> str:
-    """Collapse all separators (_, -, ., whitespace) to single spaces so
-    word-boundary regex works uniformly on both prose and filenames, e.g.
-    'GSE123_rsem_tpm.txt' -> 'GSE123 rsem tpm txt'."""
+def _normalize_for_match(text):
     return re.sub(r"[^a-zA-Z0-9]+", " ", text or "")
  
-# Each rule: (canonical name, regex, default "is this data already log-scaled?").
-# Order here does NOT determine priority — priority is resolved by *position
-# of the match in the text*, not position of the rule in this list.
 _NORM_RULES: list[tuple[str, "re.Pattern", bool]] = [
     ("median_of_ratios", re.compile(r"\bdeseq2?\b|\bmedian of ratios\b|\bsize factors?\b", re.I), False),
     ("tmm",              re.compile(r"\btmm\b|\bedger\b|\btrimmed mean\b", re.I), False),
@@ -332,8 +305,6 @@ _EXPLICIT_LOG_RE = re.compile(r"\blog ?2\b|\blog ?10\b|\blog transform|\blog sca
 _EXPLICIT_NOLOG_RE = re.compile(r"\bnot log|\bnon ?log\b|\blinear scale\b|\braw scale\b|\buntransformed\b", re.I)
  
 def _scan_norm_keywords(raw_text: str):
-    """Return (norm_type, matched_term, default_log, start_pos) for whichever
-    rule's match occurs LAST (highest start_pos) in the text, or None."""
     text = _normalize_for_match(raw_text)
     best = None
     for norm_type, pattern, default_log in _NORM_RULES:
@@ -343,14 +314,6 @@ def _scan_norm_keywords(raw_text: str):
     return best
  
 def detect_normalization(dp_text: str = "", filename: str = "") -> NormInfo:
-    """
-    Scans the `data_processing` prose first (most authoritative source),
-    falling back to the filename only if the prose has no recognizable
-    keyword. Within whichever text is used, picks the LAST matching keyword
-    rather than the first match found, since both GEO's data_processing
-    field and supplementary filenames tend to name the final processing
-    step last (e.g. "...counted, then TPM-normalized" or "..._rsem_tpm.txt").
-    """
     hit = _scan_norm_keywords(dp_text)
     source = "data_processing_text"
     if hit is None and filename:
@@ -589,7 +552,6 @@ def select_gpl(results):
                 st.stop()
         else:
             selected_gpl = meta["gpl_ids"][0]
- 
         return {selected_gpl: results[selected_gpl]}
  
  
@@ -743,26 +705,59 @@ class GseResult:
         return (f"GseResult(acc={self.accession!r}, "
                 f"orig_norm={self.normalization_type!r}, "
                 f"effective={self.effective_norm!r}, ")
+
+def _is_gzip(path: Path) -> bool:
+    with open(path, "rb") as f:
+        return f.read(2) == b"\x1f\x8b"
+
+def _gunzip_to_disk(path: Path) -> Path:
+    """Stream-decompress without holding the file in memory."""
+    out = path.with_suffix(".plain")
+    with gzip.open(path, "rb") as src, open(out, "wb") as dst:
+        shutil.copyfileobj(src, dst, 1024 * 1024)
+    return out
+
+def _peek(path: Path, n: int = 16384) -> bytes:
+    with open(path, "rb") as f:
+        return f.read(n)
+    
+MAX_DOWNLOAD_BYTES = 5 * 1024**3          
+DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "geo_downloads"
  
- 
-def _download_bytes(url: str, cap=MAX_DOWNLOAD_BYTES) -> Optional[bytes]:
-    buf = io.BytesIO()
-    with requests.get(url, stream=True, timeout=(30, 300)) as r:
-        r.raise_for_status()
-        for chunk in r.iter_content(1024 * 1024):
-            buf.write(chunk)
-            if buf.tell() > cap:
+def _download_bytes(url: str, cap=MAX_DOWNLOAD_BYTES) -> Optional[Path]:
+    """Stream url to a temp file. Returns its Path, or None if over the cap."""
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dest = DOWNLOAD_DIR / f"{uuid.uuid4().hex}.download"
+    written = 0
+    try:
+        with requests.get(url, stream=True, timeout=(30, 300)) as r:
+            r.raise_for_status()
+            declared = int(r.headers.get("Content-Length") or 0)
+            if declared > cap:                    
                 return None
-    return buf.getvalue()
- 
- 
- 
-def _download_all(urls: list[str]) -> dict[str, Optional[bytes]]:
-    results: dict[str, Optional[bytes]] = {}
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(1024 * 1024):
+                    written += len(chunk)
+                    if written > cap:           
+                        raise _TooBig()
+                    f.write(chunk)
+        return dest
+    except _TooBig:
+        dest.unlink(missing_ok=True)
+        return None
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
+
+class _TooBig(Exception):
+    pass
+
+
+def _download_all(urls: list[str]) -> dict[str, Optional[Path]]:
+    results: dict[str, Optional[Path]] = {}
     if not urls:
         return results
- 
-    # Limit workers so we don't spam open thousands of connections simultaneously
+
     workers = min(1, len(urls))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         fut_to_url = {ex.submit(_download_bytes, u): u for u in urls}
@@ -773,12 +768,11 @@ def _download_all(urls: list[str]) -> dict[str, Optional[bytes]]:
                 res = fut.result()
                 results[url] = res
                 if res is not None:
-                    print(f"    ✓ {fname} ({len(res) / 1e6:.1f} MB)")
+                    print(f"    ✓ {fname} ({res.stat().st_size / 1e6:.1f} MB on disk)")
                 else:
                     print(f"    ✗ {fname}: Failed or exceeded size limit")
             except Exception as e:
                 print(f"    ✗ {fname}: {e}")
- 
     return results
  
 #simple helper functions
@@ -940,12 +934,12 @@ def _parse_tabular_series(raw: bytes, filename: str) -> tuple[pd.Series, str]:
  
 def _build_matrix_from_tar(url_bytes, file_meta):
     series_list = []
- 
+
     for meta in file_meta:
-        raw = url_bytes.get(meta.url)
-        if raw is None:
+        path = url_bytes.get(meta.url)
+        if path is None:
             continue
-        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tf:
+        with tarfile.open(name=path, mode="r:*") as tf:
             for member in tf:
                 if not member.isfile():
                     continue
@@ -978,25 +972,27 @@ def _build_matrix_from_tar(url_bytes, file_meta):
  
 def _build_matrix_from_flat_files(url_bytes, file_meta):
     dfs = []
- 
+
     for meta in file_meta:
-        raw = url_bytes.get(meta.url)
-        if raw is None:
+        path = url_bytes.get(meta.url)
+        if path is None:
             continue
         filename = meta.filename
+        plain = path
         try:
-            if filename.endswith(".gz"):
-                raw = gzip.decompress(raw)
-                filename = filename[:-3]
- 
+            if _is_gzip(path):
+                plain = _gunzip_to_disk(path)
+                if filename.endswith(".gz"):
+                    filename = filename[:-3]
+
             lower = filename.lower()
             if lower.endswith(".xls") or lower.endswith(".xlsx"):
-                df = pd.read_excel(io.BytesIO(raw), index_col=0)
+                df = pd.read_excel(plain, index_col=0)
             else:
-                sr = detect_delimiter(raw)
+                sr = detect_delimiter(_peek(plain))
                 df = pd.read_csv(
-                    io.BytesIO(raw), sep=sr[0],
-                    lineterminator= sr[1],
+                    plain, sep=sr[0],
+                    lineterminator=sr[1],
                     index_col=0, on_bad_lines="skip",
                 )
                 numeric_cols = df.select_dtypes(include=[np.number]).columns
@@ -1017,9 +1013,13 @@ def _build_matrix_from_flat_files(url_bytes, file_meta):
  
  
             dfs.append(df)
+
         except Exception as e:
             print(f"Error: {e}")
             return pd.DataFrame()
+        finally:
+            if plain != path:
+                plain.unlink(missing_ok=True)
  
     if not dfs:
         return pd.DataFrame()
@@ -1144,13 +1144,17 @@ def fetch_and_normalize(
         print(f"\n  Processing: {c.filename}")
  
         url_bytes = _download_all([c.url])
- 
-        if url_bytes.get(c.url) is None:
+        dl_path = url_bytes.get(c.url)
+
+        if dl_path is None:
             print(f"    Exceeded file size, skipping {c.url}")
             return None
- 
-        counts_df = _fetch_counts_df(accession, selected, url_bytes)
- 
+
+        try:
+            counts_df = _fetch_counts_df(accession, selected, url_bytes)
+        finally:
+            dl_path.unlink(missing_ok=True)
+
         gc.collect()
  
         if counts_df.empty:
@@ -1175,7 +1179,15 @@ def fetch_and_normalize(
  
         cache_path = geo_cache_dir / f"{accession}_{c.filename}_{id(c)}.parquet"
         modified_path = geo_cache_dir / f"{accession}_{c.filename}_{id(c)}_modified.parquet"
-        counts_df.to_parquet(cache_path, compression="gzip")
+
+        # buffer = io.BytesIO()
+        # counts_df.to_parquet(buffer, index=False)
+        # buffer.seek(0)
+
+        # cache.add(cache_path, buffer.getvalue())
+        # cache.add(modified_path, buffer.getvalue())
+
+        counts_df.to_parquet(cache_path)
         shutil.copy(cache_path, modified_path)
  
         meta_entry = {
@@ -1310,8 +1322,15 @@ def fetch_microarray_matrix(meta: dict):
     geo_cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = geo_cache_dir / f"{gse_id}_microarray.parquet"
     modified_path = geo_cache_dir / f"{gse_id}_microarray_modified.parquet"
- 
-    final_df.to_parquet(cache_path, compression="gzip")
+
+    # buffer = io.BytesIO()
+    # final_df.to_parquet(buffer, index=False)
+    # buffer.seek(0)
+
+    # cache.add(cache_path, buffer.getvalue())
+    # cache.add(modified_path, buffer.getvalue())
+
+    final_df.to_parquet(cache_path)
     shutil.copy(cache_path, modified_path)
  
     meta_entry = {
@@ -1486,12 +1505,13 @@ SILHOUETTE_WARNING = 0.5
 
 
 def _load_numeric(source_path):
-    schema = pq.read_schema(source_path)
+    schema = get_schema(source_path)
     numeric_cols = [
         f.name for f in schema
         if pt.is_integer(f.type) or pt.is_floating(f.type)
     ]
-    return pq.read_table(source_path, columns=numeric_cols).to_pandas().astype(np.float32)
+
+    return get_parquet(source_path, columns = numeric_cols).to_pandas().astype(np.float32)
 
 
 def _factor_labels(char_df, col, samples):
@@ -1547,11 +1567,8 @@ def compute_depth(source_path):
 
 
 
-def qc(char_df, gse_id, source_path, modified_path, normalization_type):
+def qc(char_df, gse_id, source_path, modified_path, normalization_type, selected_columns):
     with st.expander("Quality Control", expanded=False):
-        selected_columns = column_selector(
-            modified_path, "qc_panel", gse_id, "qc", str(modified_path)
-        )
         st.session_state["selected_columns_for_download"] = selected_columns
         selected = set(selected_columns)
 
@@ -1778,8 +1795,8 @@ def annotate_columns(i, char_df, gse_id, source_path, modified_path):
             else:
                 for gsm in char_df.index:
                     column_mapping[gsm] = "_".join([str(char_df[x].loc[gsm]) for x in current_selection]) + f"_{gsm}"
- 
-            modified_df = pq.read_table(modified_path)
+
+            modified_df = get_parquet(modified_path)
  
             dynamic_mapping = {}
             for col in modified_df.column_names:
@@ -1814,69 +1831,85 @@ def annotate_columns(i, char_df, gse_id, source_path, modified_path):
 def column_selector(counts_path, i, gse_id, state, suffix):
     parquet_file = pq.ParquetFile(counts_path)
     all_columns = parquet_file.schema.names
- 
+
     state_key = f"selected_cols_dict_{gse_id}_{state}_{suffix}"
     if state_key not in st.session_state:
         st.session_state[state_key] = {col: True for col in all_columns}
- 
+
+    st.markdown("### Select Columns to Include in Download \n" \
+    "You can search for specific columns using the search bar below. Uncheck any columns you wish to exclude from your download." \
+    "You can use the Quality Control data below to inform your column selections.")
     search_term = st.text_input("Search columns", key=f"search_bar_{i}_{suffix}")
- 
+
     filtered_columns = [
         col for col in all_columns
         if search_term.lower() in col.lower()
     ] if search_term else list(all_columns)
- 
+
     def select_all():
         for col in filtered_columns:
             st.session_state[state_key][col] = True
             st.session_state[f"ui_{col}_{i}_{suffix}_key"] = True
- 
+        st.session_state["_force_full_rerun"] = True 
+
     def deselect_all():
         for col in filtered_columns:
             st.session_state[state_key][col] = False
             st.session_state[f"ui_{col}_{i}_{suffix}_key"] = False
- 
+        st.session_state["_force_full_rerun"] = True 
+
     col1, col2 = st.columns(2)
     with col1:
         st.button("Select All", on_click=select_all, key=f"select_all_{i}_{suffix}")
     with col2:
         st.button("Deselect All", on_click=deselect_all, key=f"deselect_all_{i}_{suffix}")
- 
+
     with st.expander("Show All Columns", expanded=False):
         num_grid_cols = 4
         grid_columns = st.columns(num_grid_cols)
- 
+
         for idx, col in enumerate(filtered_columns):
             def update_single_col(c=col):
                 st.session_state[state_key][c] = st.session_state[f"ui_{c}_{i}_{suffix}_key"]
- 
+                st.session_state["_force_full_rerun"] = True 
+        
+
             widget_key = f"ui_{col}_{i}_{suffix}_key"
- 
+
             if col not in st.session_state[state_key]:
                 st.session_state[state_key][col] = True
- 
-            if widget_key not in st.session_state:
-                st.session_state[widget_key] = st.session_state[state_key][col]
- 
+
+            st.session_state[widget_key] = st.session_state[state_key][col]
+
             with grid_columns[idx % num_grid_cols]:
                 st.checkbox(
                     col,
                     key=widget_key,
                     on_change=update_single_col
                 )
- 
+
     selected_columns = [
         col for col in all_columns
         if st.session_state[state_key].get(col, True)
     ]
- 
+
     return selected_columns
+
+def get_parquet(path, **kwargs):
+    # reader = pa.BufferReader(cache.get(path))
+    # return pq.read_table(reader, **kwargs)
+    return pq.read_table(path, **kwargs)
+
+def get_schema(path, **kwargs):
+    # reader = pa.BufferReader(cache.get(path))
+    # return pq.read_schema(reader, **kwargs)
+    return pq.read_schema(path, **kwargs)
  
 def apply_norm(modified_path, norm, col_list, i, source_path):
     target_cols = set(col_list)
  
-    schema = pq.read_schema(modified_path)
-    base_schema = pq.read_schema(source_path)
+    schema = get_schema(modified_path)
+    base_schema = get_schema(source_path)
     base_column_set = set(base_schema.names)
  
     numeric_cols = [
@@ -1897,9 +1930,9 @@ def apply_norm(modified_path, norm, col_list, i, source_path):
             valid_numeric_cols.append(col)
  
     if not base_gsm_cols:
-        return pq.read_table(modified_path)
+        return get_parquet(modified_path)
  
-    numeric_df = pq.read_table(source_path, columns=base_gsm_cols)
+    numeric_df = get_parquet(modified_path, columns = base_gsm_cols)
     numeric_df = numeric_df.rename_columns(valid_numeric_cols)
  
     if norm == "none":
@@ -1955,12 +1988,12 @@ def apply_norm(modified_path, norm, col_list, i, source_path):
     else:
         del numeric_df
         gc.collect()
-        return pq.read_table(modified_path)
+        return get_parquet(modified_path)
  
     del numeric_df
     gc.collect()
  
-    df = pq.read_table(modified_path)
+    df = get_parquet(modified_path)
  
     overlapping_cols = set(valid_numeric_cols).intersection(df.column_names)
     if overlapping_cols:
@@ -1988,7 +2021,8 @@ def download_dialog():
             current_norm = current_norms[i]
             norm_suffix = f"_{current_norm}" if current_norm != "none" else ""
             return (f"download_{i}", get_txt_gz_stream((meta_entry["modified_path"]), 
-                                                        columns = columns), f"{gse_id}_{meta_entry['normalization_type']}{norm_suffix}.txt.gz")
+                                                        columns = columns), f"{gse_id}_{meta_entry['normalization_type']}{norm_suffix}.txt.gz",
+                                                        meta_entry)
 
         select_dict = {}
         for i, meta_entry in enumerate(result_lists):
@@ -2004,69 +2038,90 @@ def download_dialog():
             selected_path, "download", gse_id, "qc", selected_path
         )
 
+        char_df = st.session_state.char_df.copy()
+        gsm_filter = []
+        for g in list(st.session_state.current_gpl.keys()):
+            if g != "ncbi":
+                gsm_filter.extend(meta["gsm_gpl_dict"][g])
+        if not gsm_filter:
+            gsm_filter = meta["gsm_ids"]
+
+        
         res = prep_download(select_dict[st.session_state["selected_path_for_download"]][0], select_dict[st.session_state["selected_path_for_download"]][1],
                             columns = selected_columns)
         if res is not None:
-            signature = st.text_area(
-                "Paste signature to check availability (any punctuation okay)"
-            )
+            # signature = st.text_area(
+            #     "Paste signature to check availability (any punctuation okay)"
+            # )
 
-            signature_list = re.split(r'[;,\s]', signature)
+            # signature_list = re.split(r'[;,\s]', signature)
 
-            signature_set = set([s.strip() for s in signature_list if s.strip()])
+            # signature_set = set([s.strip() for s in signature_list if s.strip()])
 
 
-            if signature_set:
-                hngc_data = fetch_hgnc_table()
-                df = pq.read_table(meta_entry["modified_path"], columns=["Name"]).to_pandas()
-                available_genes = set(df["Name"].dropna().unique())
-                print(list(available_genes)[:10])
+            # if signature_set:
+            #     hngc_data = fetch_hgnc_table()
+            #     df = pq.read_table(meta_entry["modified_path"], columns=["Name"]).to_pandas()
+            #     available_genes = set(df["Name"].dropna().unique())
+            #     print(list(available_genes)[:10])
 
-                signature_set_symbol = signature_set.intersection(set(hngc_data["symbol"].dropna().unique()))
-                signature_set_alias = signature_set.intersection(set(hngc_data["alias_symbol"].dropna().unique()))
-                signature_set_prev = signature_set.intersection(set(hngc_data["prev_symbol"].dropna().unique()))
-                missing_genes_symbol = signature_set_symbol - available_genes
-                missing_genes_alias = signature_set_alias - available_genes
-                missing_genes_prev = signature_set_prev - available_genes
+            #     signature_set_symbol = signature_set.intersection(set(hngc_data["symbol"].dropna().unique()))
+            #     signature_set_alias = signature_set.intersection(set(hngc_data["alias_symbol"].dropna().unique()))
+            #     signature_set_prev = signature_set.intersection(set(hngc_data["prev_symbol"].dropna().unique()))
+            #     missing_genes_symbol = signature_set_symbol - available_genes
+            #     missing_genes_alias = signature_set_alias - available_genes
+            #     missing_genes_prev = signature_set_prev - available_genes
 
-                print(missing_genes_symbol.intersection(missing_genes_alias).intersection(missing_genes_prev))
+            #     print(missing_genes_symbol.intersection(missing_genes_alias).intersection(missing_genes_prev))
 
-                if intersection := missing_genes_symbol.intersection(missing_genes_alias).intersection(missing_genes_prev):
+            #     if intersection := missing_genes_symbol.intersection(missing_genes_alias).intersection(missing_genes_prev):
                     
-                    st.warning(
-                        f"{len(intersection)} gene(s) from your signature were not found in this dataset: "
-                        + ", ".join(list(intersection)[:10]) + ("..." if len(intersection) > 10 else "")
-                    )
+            #         st.warning(
+            #             f"{len(intersection)} gene(s) from your signature were not found in this dataset: "
+            #             + ", ".join(list(intersection)[:10]) + ("..." if len(intersection) > 10 else "")
+            #         )
 
-                    log_record(
-                        "signature_check", "User checked signature against dataset.",
-                        missing_genes=list(intersection),
-                    )
-                else:
-                    st.success("All genes from your signature are present in this dataset.")
+            #         log_record(
+            #             "signature_check", "User checked signature against dataset.",
+            #             missing_genes=list(intersection),
+            #         )
+            #     else:
+            #         st.success("All genes from your signature are present in this dataset.")
 
+            qc_meta_entry = res[3]
+            qc(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, qc_meta_entry["path"], qc_meta_entry["modified_path"], qc_meta_entry["normalization_type"], selected_columns)
+            if st.session_state.get("_force_full_rerun"):
+                st.session_state["_force_full_rerun"] = False
+                st.rerun()
+
+            st.markdown("### Download Dataset \n" \
+            "Click the button below to download the dataset as a tab-separated text file. The file will be compressed using gzip to reduce download size.")
 
             st.download_button(
-                label="⬇",
+                label="Download Dataset ⬇",
                 key=res[0],
                 data=res[1],
                 file_name=res[2],
                 mime="application/gzip",
             )
 
-        if st.session_state.get("provenance_log"):
+        if st.session_state.get("record_log"):
+
+            st.markdown("### Download Provenance Record \n" \
+            "Click the button below to download a JSON file containing a record of the actions taken during the analysis. This can be used for reproducibility and tracking of the analysis steps.")
+
             record_payload = {
                 "gse_id": gse_id,
                 "accessed": datetime.now(timezone.utc).isoformat(),
                 "tool_version": "geo-2-compass-0.1", 
-                "events": st.session_state.provenance_log,
+                "events": st.session_state.record_log,
             }
             st.download_button(
-                label="⬇ Download provenance log (.json)",
+                label="⬇ Download provenance (.json)",
                 data=json.dumps(record_payload, indent=2, default=str),
-                file_name=f"{gse_id}_provenance.json",
+                file_name=f"{gse_id}_record.json",
                 mime="application/json",
-                key="download_provenance",
+                key="download_record",
             )
 
 
@@ -2115,10 +2170,16 @@ if st.session_state.result_lists is not None:
     st.session_state.current_gpl = select_gpl(st.session_state.gpl_data)
  
     char_df = st.session_state.char_df.copy()
+
  
     gsm_filter = []
+    
     for g in list(st.session_state.current_gpl.keys()):
-        gsm_filter.extend(meta["gsm_gpl_dict"][g])
+        if g != "ncbi":
+            gsm_filter.extend(meta["gsm_gpl_dict"][g])
+
+    if not gsm_filter:
+        gsm_filter = meta["gsm_ids"]
  
     survival_metadata_ui(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")])
 
@@ -2129,7 +2190,7 @@ if st.session_state.result_lists is not None:
         if meta_entry["normalization_type"] == "raw_counts":
             qc_meta_entry = meta_entry
 
-    qc(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, qc_meta_entry["path"], qc_meta_entry["modified_path"], qc_meta_entry["normalization_type"])
+    # qc(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, qc_meta_entry["path"], qc_meta_entry["modified_path"], qc_meta_entry["normalization_type"])
     st.markdown("""
         <style>
             .normalization {
@@ -2180,6 +2241,7 @@ if st.session_state.result_lists is not None:
         c1.metric("Genes", f"{n_genes:,}")
         c2.metric("Samples", len(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")]))
 
+        print(gsm_filter)
         
         annotate_columns(i, char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, meta_entry["path"], meta_entry["modified_path"])
  
@@ -2239,6 +2301,9 @@ if st.session_state.result_lists is not None:
             for g in st.session_state.current_gpl.keys()
             for gsm in meta.get("gsm_gpl_dict", {}).get(g, [])
         }
+
+        if gsm_filter == set():
+            gsm_filter = set(meta.get("gsm_ids", []))
  
         all_cols = []
         for col in schema_names:
