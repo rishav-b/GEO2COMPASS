@@ -18,15 +18,22 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
 import uuid
 from datetime import datetime, timezone
-from diskcache import Cache
+import math
+from collections import Counter
+import os
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import pyarrow.parquet as pq
+import pyarrow.types as pt
+import streamlit as st
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
  
 # PyArrow 25.0.0 can segfault when Streamlit initializes Arrow from a
 # ScriptRunner thread. Use the system allocator even if the deployment
 # environment does not define this variable .
 os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
-cache = Cache("./geo_cache", 
-              size_limit=2 * 1024**3,
-              eviction_policy="least-recently-used")
  
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -42,15 +49,56 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from gprofiler import GProfiler
  
-st.set_page_config(page_title="GEO-2-COMPASS")
+st.set_page_config(page_title="GEO-2-COMPASS", layout = "wide")
 st.title("GEO-2-COMPASS")
- 
-MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
+
+
+
 MAX_MATRIX_CELLS = 150_000_000
 PREVIEW_ROWS = 1_000
 PREVIEW_COLUMNS = 150
+
+st.markdown(
+    """
+    <style>
+    .st-key-purple_expander {
+        border-radius: 8px;
+        color: rgb(101, 68, 163);
+        background-color: rgba(35, 25, 195, 0.10);
+    }
+    .st-key-blue_button button, 
+    .st-key-blue_button1 button {
+        background-color: rgba(25, 105, 195, 0.1);
+        color: rgb(50, 94, 163);
+        border: solid 2px rgb(50, 94, 163);
+    }
+
+    .st-key-orange_button button {
+        background-color: rgba(223, 155, 99, 0.25);
+        color: rgb(184, 96, 41);
+        border: solid 2px rgb(184, 96, 41);
+    }
+
+    .st-key-blue_button button:hover,
+    .st-key-blue_button1 button:hover {
+        background-color: rgba(25, 105, 195, 0.2);
+        border: solid 2px rgb(50, 94, 163);
+    }
+
+    .st-key-orange_button button:hover {
+        background-color: rgba(143, 75, 19, 0.25);
+        border: solid 2px rgb(184, 96, 41);
+    }
+
+    
+
+    </style>
+    """, unsafe_allow_html=True
+)
  
 loaded_keys = [k for k in st.session_state.keys() if k.startswith("df_")]
+
+
  
 with st.form("geo_accession_form"):
     requested_gse_id = st.text_input(
@@ -58,7 +106,8 @@ with st.form("geo_accession_form"):
         value=st.session_state.get("active_gse_id", ""),
         placeholder="e.g. GSE183620",
     )
-    load_accession = st.form_submit_button("Load GEO metadata", type="primary")
+    with st.container(key = "blue_button1"):
+        load_accession = st.form_submit_button("Enter GSE ID", type="primary")
  
 if load_accession:
     requested_gse_id = requested_gse_id.strip().upper()
@@ -77,7 +126,7 @@ if load_accession:
  
 gse_id = st.session_state.get("active_gse_id", "")
 if not gse_id:
-    st.info("Enter a GEO Series accession and select **Load GEO metadata**.")
+    st.info("Enter a GEO Series accession and select **Enter GSE ID**.")
     st.stop()
  
 if "run_pipeline" not in st.session_state:
@@ -154,6 +203,7 @@ def fetch_metadata(gse_id: str, gse) -> dict:
             "gse_id": gse_id,
             "type":       study_type,
             "gsm_ids":    gsm_list,
+            "all_gsm_ids": gsm_list,
             "gpl_ids":    gpl_ids,
             "gpl_titles": gpl_titles,
             "gsm_gpl_dict": gsm_gpl_dict,
@@ -163,6 +213,7 @@ def fetch_metadata(gse_id: str, gse) -> dict:
  
     except Exception as e:
         return {"error": str(e)}
+    
  
 @st.cache_resource(
     show_spinner="Downloading and parsing GEO metadata…",
@@ -244,9 +295,408 @@ try:
 except RuntimeError as exc:
     st.error(str(exc))
     st.stop()
- 
+
+@st.fragment
+def column_selector(counts_path, i, gse_id, state, suffix, filter = None):
+    parquet_file = pq.ParquetFile(counts_path)
+    all_columns = parquet_file.schema.names
+
+    if filter is not None:
+        all_columns = [a for a in all_columns if a in filter]
+
+    state_key = f"selected_cols_dict_{gse_id}_{state}_{suffix}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = {col: True for col in all_columns}
+
+    st.markdown("### Select Columns to Include in Download \n" \
+    "You can search for specific columns using the search bar below. Uncheck any columns you wish to exclude from your download." \
+    "You can use the Quality Control data below to inform your column selections.")
+    search_term = st.text_input("Search columns", key=f"search_bar_{i}_{suffix}")
+
+    filtered_columns = [
+        col for col in all_columns
+        if search_term.lower() in col.lower()
+    ] if search_term else list(all_columns)
+
+
+    def select_all():
+        for col in filtered_columns:
+            st.session_state[state_key][col] = True
+            st.session_state[f"ui_{col}_{i}_{suffix}_key"] = True
+        st.session_state["_force_full_rerun"] = True 
+
+    def deselect_all():
+        for col in filtered_columns:
+            st.session_state[state_key][col] = False
+            st.session_state[f"ui_{col}_{i}_{suffix}_key"] = False
+        st.session_state["_force_full_rerun"] = True 
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.button("Select All", on_click=select_all, key=f"select_all_{i}_{suffix}")
+    with col2:
+        st.button("Deselect All", on_click=deselect_all, key=f"deselect_all_{i}_{suffix}")
+
+    with st.expander("Show All Columns", expanded=False):
+        num_grid_cols = 4
+        grid_columns = st.columns(num_grid_cols)
+
+        for idx, col in enumerate(filtered_columns):
+            def update_single_col(c=col):
+                st.session_state[state_key][c] = st.session_state[f"ui_{c}_{i}_{suffix}_key"]
+                st.session_state["_force_full_rerun"] = True 
+        
+
+            widget_key = f"ui_{col}_{i}_{suffix}_key"
+
+            if col not in st.session_state[state_key]:
+                st.session_state[state_key][col] = True
+
+            st.session_state[widget_key] = st.session_state[state_key][col]
+
+            with grid_columns[idx % num_grid_cols]:
+                st.checkbox(
+                    col,
+                    key=widget_key,
+                    on_change=update_single_col
+                )
+
+    selected_columns = [
+        col for col in all_columns
+        if st.session_state[state_key].get(col, True)
+    ]
+
+    return selected_columns
+
+MAX_ROWS_FOR_QC = 5000
+SILHOUETTE_WARNING = 0.5
+
+
+def _load_numeric(source_path):
+    schema = get_schema(source_path)
+    numeric_cols = [
+        f.name for f in schema
+        if pt.is_integer(f.type) or pt.is_floating(f.type)
+    ]
+    return get_parquet(source_path, columns=numeric_cols).to_pandas().astype(np.float32)
+
+
+def _factor_labels(char_df, col, samples):
+    lookup = char_df[col]
+    lookup = lookup[~lookup.index.duplicated(keep="first")]
+    return pd.Series(samples, index=samples).map(lookup).fillna("NA").astype(str)
+
+
+@st.cache_data(show_spinner="PCA and RLE Loading")
+def compute_microarray_qc(source_path, char_df, raw=False):
+    source_df = _load_numeric(source_path)
+    if raw:
+        source_df = source_df[(source_df >= 10).sum(axis=1) >= 3]          
+        cpm = source_df / source_df.sum(axis=0) * 1e6           
+        logcpm = np.log2(cpm + 1)                               
+        top = logcpm.var(axis=1).nlargest(1000).index 
+        X = logcpm.loc[top].T
+
+    if source_df.max().max() > 100: 
+        source_df = np.log2(source_df.clip(lower=0) + 1)
+        st.warning("Existing data was likely linearly scaled, so for PCA and RLE purposes it has been log scaled.")
+
+    if not raw:
+        X = source_df.T
+        X = X.fillna(X.mean()).dropna(axis=1)
+
+    pca = PCA(n_components=2, svd_solver="randomized", random_state=0)
+    pcs = pca.fit_transform(X)
+    pca_base = pd.DataFrame(pcs, columns=["PC1", "PC2"], index=X.index)
+    pca_base["Sample"] = pca_base.index
+    var_explained = pca.explained_variance_ratio_ * 100
+
+    if len(source_df) > MAX_ROWS_FOR_QC:
+        source_df = source_df.sample(MAX_ROWS_FOR_QC, random_state=0)
+    deviation_df = source_df.sub(source_df.median(axis=1), axis=0)
+    box_df = deviation_df.melt(var_name="Sample", value_name="Deviation")
+
+    silhouettes = {}
+    for col in char_df.columns:
+        labels = _factor_labels(char_df, col, pca_base["Sample"])
+        if 1 < labels.nunique() < len(labels):
+            silhouettes[col] = silhouette_score(pcs, labels)
+
+    return pca_base, var_explained, box_df, silhouettes
+
+
+@st.cache_data(show_spinner="Sequencing Depth Loading ")
+def compute_depth(source_path):
+    source_df = _load_numeric(source_path)
+    return pd.DataFrame({"Sample": source_df.columns, "Depth": source_df.sum(axis=0).values})
+
+
+def qc(char_df, gse_id, source_path, modified_path, normalization_type, selected_columns):
+    with st.expander("Quality Control", expanded=False):
+        st.session_state["selected_columns_for_download"] = selected_columns
+        selected = set(selected_columns)
+        depth_df = None
+
+        if "microarray" in str(source_path):
+            pca_base, var_explained, box_df, silhouettes = compute_microarray_qc(
+                str(source_path), char_df
+            )
+            best_col = max(silhouettes, key=silhouettes.get) if silhouettes else char_df.columns[0]
+
+            st.markdown(
+                "#### Sample PCA\n"
+                "Each point is one sample. Samples with similar gene expression sit close together. "
+                "Use this to spot **outliers** (points far from everything else) that may be bad "
+                "samples worth removing."
+            )
+            color_col = st.selectbox(
+                "Varied Factor (color the samples by...)",
+                char_df.columns,
+                list(char_df.columns).index(best_col),
+                key=f"qc_rle_selector",
+                help="Defaults to the factor that best separates samples on the PCA.",
+            )
+
+            pca_df = pca_base.copy()
+            pca_df[color_col] = _factor_labels(char_df, color_col, pca_df["Sample"]).values
+            pca_df["Status"] = np.where(pca_df["Sample"].isin(selected), "Kept", "Removed")
+
+            score = silhouettes.get(color_col)
+            if score is not None and score > SILHOUETTE_WARNING:
+                st.warning(
+                    f"Samples separate very strongly by **{color_col}** "
+                    f"(silhouette score = {score:.2f}). If this factor is not a real biological "
+                    "difference, there is a strong potential for **batch effects**."
+                )
+
+            n_removed = int((pca_df["Status"] == "Removed").sum())
+            st.caption(
+                f"Circle = sample kept | X = sample removed | {len(pca_df) - n_removed} kept, {n_removed} removed"
+            )
+
+            pca_fig = px.scatter(
+                pca_df, x="PC1", y="PC2", color=color_col, symbol="Status",
+                symbol_map={"Kept": "circle", "Removed": "x"}, hover_name="Sample",
+                labels={
+                    "PC1": f"PC1 ({var_explained[0]:.1f}% of variance)",
+                    "PC2": f"PC2 ({var_explained[1]:.1f}% of variance)",
+                },
+                title="Sample PCA",
+            )
+            pca_fig.update_traces(marker=dict(size=10))
+            st.plotly_chart(pca_fig, key=f"qc_pca")
+
+            st.markdown(
+                "#### Relative Log Expression (RLE)\n"
+                "Each box shows how far one sample's genes deviate from the typical median gene value."
+            )
+            box_df = box_df.copy()
+            box_df[color_col] = box_df["Sample"].map(dict(zip(pca_df["Sample"], pca_df[color_col])))
+            box_df = box_df.sort_values(by=color_col)
+
+            fig = px.box(box_df, x="Sample", y="Deviation", color=color_col, points=False)
+            st.plotly_chart(fig, key=f"qc_plot")
+
+            qc_summary_df = pca_df[["Sample", color_col, "Status"]].rename(columns={color_col: "colored_by"})
+            st.download_button(
+                label="⬇ Download QC summary (.csv)",
+                data=qc_summary_df.to_csv(index=False),
+                file_name=f"{gse_id}_qc_summary.csv",
+                mime="text/csv",
+                key="download_qc_summary",
+            )
+        else:
+            pca_base, var_explained, box_df, silhouettes = compute_microarray_qc(
+                str(source_path), char_df, raw=True
+            )
+            best_col = max(silhouettes, key=silhouettes.get) if silhouettes else char_df.columns[0]
+
+            st.markdown(
+                "#### Sample PCA\n"
+                "Each point is one sample. Use this to spot outliers."
+            )
+            color_col = st.selectbox(
+                "Varied Factor (color the samples by...)",
+                char_df.columns,
+                list(char_df.columns).index(best_col),
+                key=f"qc_rle_selector_rna",
+            )
+
+            pca_df = pca_base.copy()
+            pca_df[color_col] = _factor_labels(char_df, color_col, pca_df["Sample"]).values
+            pca_df["Status"] = np.where(pca_df["Sample"].isin(selected), "Kept", "Removed")
+
+            pca_fig = px.scatter(
+                pca_df, x="PC1", y="PC2", color=color_col, symbol="Status",
+                symbol_map={"Kept": "circle", "Removed": "x"}, hover_name="Sample",
+                title="Sample PCA",
+            )
+            st.plotly_chart(pca_fig, key=f"qc_pca_rna")
+
+            if normalization_type == "raw_counts":
+                depth_df = compute_depth(str(source_path))
+                depth_df["Status"] = np.where(depth_df["Sample"].isin(selected), "Kept", "Removed")
+                st.markdown("#### Sequencing Depth\nTotal reads per sample.")
+                fig = px.bar(
+                    depth_df, x="Sample", y="Depth", color="Status",
+                    color_discrete_map={"Kept": "blue", "Removed": "yellow"}
+                )
+                fig.add_hline(y=20e6, line_dash="dash", line_color="black", annotation_text="20M reads")
+                st.plotly_chart(fig, key=f"qc_plot_depth")
+def get_parquet(path, **kwargs):
+    # reader = pa.BufferReader(cache.get(path))
+    # return pq.read_table(reader, **kwargs)
+    return pq.read_table(path, **kwargs)
+
+def get_schema(path, **kwargs):
+    # reader = pa.BufferReader(cache.get(path))
+    # return pq.read_schema(reader, **kwargs)
+    return pq.read_schema(path, **kwargs)
+
+def get_txt_gz_stream(parquet_path: str, columns):
+    temp_dir = tempfile.gettempdir()
+    output_path = os.path.join(temp_dir, f"export_{uuid.uuid4().hex}.txt.gz")
+
+    if columns:
+        if "Name" not in columns:
+            columns = ["Name"] + columns
+        cols_sql = ", ".join(f'"{c}"' for c in columns)
+        select_clause = f"SELECT {cols_sql} FROM '{parquet_path}'"
+    else:
+        select_clause = f"SELECT * FROM '{parquet_path}'"
+
+    duckdb.execute(f"""
+        COPY ({select_clause})
+        TO '{output_path}'
+        (FORMAT 'CSV', DELIMITER '\t', HEADER TRUE, COMPRESSION 'GZIP');
+    """)
+
+    try:
+        with open(output_path, "rb") as f:
+            data = f.read()
+    finally:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+
+    return data
+
+@st.dialog("Download Data", width="large")
+def download_dialog():
+    if st.session_state.result_lists is not None:
+        result_lists = st.session_state.result_lists
+        current_norms = []
+        for i in range(len(result_lists)):
+            current_norms.append(st.session_state.get(f"norm_type_{i}", "none"))
+            
+        def prep_download(i, meta_entry, columns = None):
+            current_norm = current_norms[i]
+            norm_suffix = f"_{current_norm}" if current_norm != "none" else ""
+            return (
+                f"download_{i}", 
+                "placeholder", 
+                f"{gse_id}_{meta_entry['normalization_type']}{norm_suffix}.txt.gz",
+                meta_entry
+            )
+        
+        select_dict = {}
+        for i, meta_entry in enumerate(result_lists):
+            select_dict[meta_entry["filename"]] = (i, meta_entry)
+
+        selected_path = st.selectbox(
+            "Which dataset would you like to download?",
+            options = [x["filename"] for x in result_lists],
+            key = "selected_path_for_download"
+        )
+
+        char_df = st.session_state.char_df.copy()
+        gsm_filter = []
+        for g in list(st.session_state.current_gpl.keys()):
+            if g != "ncbi":
+                gsm_filter.extend(meta["gsm_gpl_dict"][g])
+        if not gsm_filter:
+            gsm_filter = meta["gsm_ids"]
+
+        print(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")])
+
+        state_key = f"selected_cols_dict_{gse_id}_qc_{selected_path}"
+        modified_path = select_dict[selected_path][1]["modified_path"]
+
+        if state_key not in st.session_state:
+            parquet_file = pq.ParquetFile(modified_path)
+            all_columns = parquet_file.schema.names
+            filter_cols = char_df.index[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")]
+            filtered_cols = [a for a in all_columns if a in filter_cols] if filter_cols is not None else all_columns
+            st.session_state[state_key] = {col: True for col in filtered_cols}
+
+        selected_columns = column_selector(
+            modified_path, "download", gse_id, "qc", selected_path,
+            char_df.index[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")]
+        )
+
+        state_key = f"selected_cols_dict_{gse_id}_qc_{selected_path}"
+        if state_key not in st.session_state:
+            st.session_state[state_key] = {col: True for col in selected_columns}
+        
+        # Generate the bytes directly using the currently selected columns
+        download_bytes = get_txt_gz_stream(modified_path, columns=selected_columns)
+        
+        res = prep_download(select_dict[selected_path][0], select_dict[selected_path][1], columns=selected_columns)
+        
+        if res is not None:
+            qc_meta_entry = res[3]
+            qc(
+                char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], 
+                gse_id, 
+                qc_meta_entry["path"], 
+                qc_meta_entry["modified_path"], 
+                qc_meta_entry["normalization_type"], 
+                selected_columns
+            )
+            if st.session_state.get("_force_full_rerun"):
+                st.session_state["_force_full_rerun"] = False
+                st.rerun()
+
+            st.markdown(
+                "### Download Dataset \n" \
+                "Click the button below to download the dataset as a tab-separated text file. " \
+                "The file will be compressed using gzip to reduce download size."
+            )
+            
+            st.download_button(
+                label="Download Dataset ⬇",
+                key=res[0],
+                data=download_bytes,  # Pass the generated bytes directly
+                file_name=res[2],
+                mime="application/gzip",
+            )
+
+        if st.session_state.get("record_log"):
+            st.markdown(
+                "### Download Provenance Record \n"
+                "Click the button below to download a JSON file containing a record of the actions "
+                "taken during the analysis. This can be used for reproducibility and tracking of the analysis steps."
+            )
+
+            record_payload = {
+                "gse_id": gse_id,
+                "accessed": datetime.now(timezone.utc).isoformat(),
+                "tool_version": "geo-2-compass-0.1", 
+                "events": st.session_state.record_log,
+            }
+            st.download_button(
+                label="⬇ Download provenance (.json)",
+                data=json.dumps(record_payload, indent=2, default=str),
+                file_name=f"{gse_id}_record.json",
+                mime="application/json",
+                key="download_record",
+            )
+
+            
+    else:
+        st.info("No results available yet.")
+
 meta = fetch_metadata(gse_id, GLOBAL_GSE)
- 
+
 if meta.get("error"):
     st.error(f"Failed to load metadata: {meta['error']}")
     st.stop()
@@ -255,13 +705,40 @@ if not meta.get("gsm_ids") or not meta.get("gpl_ids"):
     st.error("The GEO record does not contain usable sample or platform metadata.")
     st.stop()
  
- 
-st.subheader(meta["title"])
-st.caption(
-    f"Type: **{meta['type']}** · "
-    f"Samples: **{len(meta['gsm_ids'])}** · "
-    f"Taxon: {meta['taxon']}"
-)
+metadata_view, process_view = st.columns([1,1])
+with metadata_view:
+    st.subheader(meta["title"])
+    st.caption(
+        f"Type: **{meta['type']}** · "
+        f"Samples: **{len(meta['gsm_ids'])}** · "
+        f"Taxon: {meta['taxon']}"
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+
+        with st.container(key = "blue_button"):
+            if st.button("Fetch & Build Matrix", type="primary"):
+                folder = Path("./geo_cache")
+                for item in folder.iterdir():
+                    if item.is_file():
+                        item.unlink()
+                st.session_state.run_pipeline = True
+                st.session_state.result_lists = None
+            
+                for key in list(st.session_state.keys()):
+                    if str(key).startswith(("df_", "base_df_", "norm_type_", "preview_", "selected_cols_dict_", "pill_selector_", "active_dataset_idx")):
+                        del st.session_state[key]
+            gc.collect()
+    with c2:
+        if st.session_state.run_pipeline:
+            with st.container(key = "orange_button"):
+                if st.button("Download Data", type = "primary"):
+                    download_dialog()
+with process_view:
+    with st.expander("See user-oriented flow", expanded = True):
+        st.image("images/user_flow.png")
+    
+
  
 st.session_state.selected_gpl = meta["gpl_ids"]
  
@@ -301,7 +778,7 @@ _NORM_RULES: list[tuple[str, "re.Pattern", bool]] = [
     ("raw_counts",       re.compile(r"\braw\b|\bunnormali[sz]ed\b|\bunnorm\b|\bhtseq ?count\b|\bfeaturecounts\b|\brsem\b|\bexpected count\b", re.I), False),
 ]
  
-_EXPLICIT_LOG_RE = re.compile(r"\blog ?2\b|\blog ?10\b|\blog transform|\blog scal", re.I)
+_EXPLICIT_LOG_RE = re.compile(r"\blog ?2\b|\blog ?10\b|\blog transform|\blog scal|\bquantile\b", re.I)
 _EXPLICIT_NOLOG_RE = re.compile(r"\bnot log|\bnon ?log\b|\blinear scale\b|\braw scale\b|\buntransformed\b", re.I)
  
 def _scan_norm_keywords(raw_text: str):
@@ -488,71 +965,34 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
         return gpl_df, "gene_symbol"
  
 def select_gpl(results):
-    gene_columns = []
-    for x in results.values():
-        mapped = x[3] if len(x) > 3 else []
-        if mapped:
-            gene_columns.append(mapped)
-        else:
-            gpl_df, symbol_col = x[0], x[2]
-            if symbol_col is not None and symbol_col in getattr(gpl_df, "columns", []):
-                gene_columns.append(gpl_df[symbol_col].dropna().astype(str).tolist())
-            else:
-                gene_columns.append([])
- 
-    intersection = set()
-    union = set()
- 
- 
-    for g in gene_columns:
-        if len(intersection) == 0:
-            intersection = set(g)
-            union = union | set(g)
-        else:
-            intersection = intersection & set(g)
-            union = union | set(g)
-    if len(union) == 0:
-        return results
- 
-    print(len(intersection) / len(union))
- 
-    if len(intersection) / len(union) > 0.65:
-        log_record(
-            "gpl_selection",
-            "Platforms merged automatically (gene sets sufficiently overlapping).",
-            overlap_ratio=round(len(intersection) / len(union), 3),
-            gpl_ids=list(results.keys()),
+    
+    if len(meta["gpl_ids"]) > 1:
+        selected_gpl = st.selectbox(
+            "Multiple platforms detected. Which platform would you like to use?",
+            tuple(f"{meta['gpl_ids'][i]}:  {meta['gpl_titles'][i]}" for i in range(len(meta['gpl_ids']))),
+            index=0,
+            placeholder="Select GPL"
         )
-        return results
-    else:
-        if len(meta["gpl_ids"]) > 1:
-            selected_gpl = st.selectbox(
-                "Multiple platforms detected. Which platform would you like to use?",
-                tuple(f"{meta['gpl_ids'][i]}:  {meta['gpl_titles'][i]}" for i in range(len(meta['gpl_ids']))),
-                index=0,
-                placeholder="Select GPL"
+        if selected_gpl:
+            for key in list(st.session_state.keys()):
+                if str(key).startswith(("survival")):
+                    del st.session_state[key]
+            gc.collect()
+            selected_gpl = selected_gpl.split(":  ")[0]
+            meta['gsm_ids'] = meta["gsm_gpl_dict"][selected_gpl]
+            meta['gpl_ids'] = [selected_gpl]
+            log_record(
+                "gpl_selection",
+                "User selected a single platform; platforms were not merged.",
+                selected_gpl=selected_gpl,
+                available_gpls=meta["gpl_ids"],
             )
-            if selected_gpl:
-                for key in list(st.session_state.keys()):
-                    if str(key).startswith(("survival")):
-                        del st.session_state[key]
-                gc.collect()
-                selected_gpl = selected_gpl.split(":  ")[0]
-                meta['gsm_ids'] = meta["gsm_gpl_dict"][selected_gpl]
-                meta['gpl_ids'] = [selected_gpl]
-                log_record(
-                    "gpl_selection",
-                    "User selected a single platform; platforms were not merged.",
-                    overlap_ratio=round(len(intersection) / len(union), 3),
-                    selected_gpl=selected_gpl,
-                    available_gpls=meta["gpl_ids"],
-                )
-            else:
-                st.info("Select one platform before building the matrix.")
-                st.stop()
         else:
-            selected_gpl = meta["gpl_ids"][0]
-        return {selected_gpl: results[selected_gpl]}
+            st.info("Select one platform before building the matrix.")
+            st.stop()
+    else:
+        selected_gpl = meta["gpl_ids"][0]
+    return {selected_gpl: results.get(selected_gpl, [None, None, None])}
  
  
 def get_gene_symbol_column(counts_df, all_selected_gpls, probe_ids=None):
@@ -602,7 +1042,7 @@ def get_gene_symbol_column(counts_df, all_selected_gpls, probe_ids=None):
             if symbol_col_score < 0.30: #arbitrary
                 gpl_df, symbol_col = gene_convert(gpl_df, gse, best_col, symbol_col)
  
-            results[selected_gpl] = [gpl_df, best_col, symbol_col]
+            results[selected_gpl] = [gpl_df, best_col, symbol_col, gpl]
         else:
             raise ValueError(f"No platform data found for {gse}")
  
@@ -788,54 +1228,32 @@ def _decompress(raw: bytes, name: str) -> tuple[bytes, str]:
     return raw, name
  
  
-def detect_delimiter(
-    raw_bytes: bytes,
-    candidates=(",", "\t", ";", "|", "\n", "\r\n", "\r", " ", "~"),
-    sample_size: int = 16384,
-):
-    """Detects both column separator and record/row terminator from raw bytes.
- 
-    Evaluates candidate pairs (col_sep, row_sep) by scoring grid uniformity.
-    """
+def detect_delimiter(raw_bytes, candidates=(",", "\t", ";", "|", " ", "~"),
+                     row_candidates=("\r\n", "\n", "\r"), sample_size=65536):
     text = raw_bytes[:sample_size].decode("utf-8", errors="ignore")
- 
-    best_pair = (",", "\n")
-    best_score = -1.0
- 
-    # Evaluate every combination of column separator S and record separator R
-    for r_sep in candidates:
-        # Split records using candidate row separator
-        records = [r for r in text.split(r_sep) if r.strip()][:30]
+
+    best_pair, best_score = (",", "\n"), -1.0
+
+    for r_sep in row_candidates:
+        records = [r for r in text.split(r_sep) if r.strip()][:50]
         if len(records) < 2:
             continue
- 
+
         for c_sep in candidates:
-            if c_sep == r_sep:
+            counts = [len(rec.split(c_sep)) for rec in records]
+            mode, mode_n = Counter(counts).most_common(1)[0]
+            if mode <= 1:
                 continue
- 
-            # Count fields per record
-            row_lengths = [len(rec.split(c_sep)) for rec in records]
-            if not row_lengths:
+
+            consistency = mode_n / len(counts)
+            if consistency < 0.5:
                 continue
- 
-            avg_cols = sum(row_lengths) / len(row_lengths)
- 
-            # Ignore single-column results or empty splits
-            if avg_cols <= 1.05:
-                continue
- 
-            # Calculate variance in column count across records
-            variance = sum((x - avg_cols) ** 2 for x in row_lengths) / len(
-                row_lengths
-            )
- 
-            # Score prioritizes high field count with perfect uniformity (0 variance)
-            score = (avg_cols * len(records)) / (1.0 + (variance * 10.0))
- 
+
+            score = consistency * math.log(mode)
+
             if score > best_score:
-                best_score = score
-                best_pair = (c_sep, r_sep)
- 
+                best_score, best_pair = score, (c_sep, r_sep)
+
     return best_pair
  
  
@@ -989,12 +1407,26 @@ def _build_matrix_from_flat_files(url_bytes, file_meta):
             if lower.endswith(".xls") or lower.endswith(".xlsx"):
                 df = pd.read_excel(plain, index_col=0)
             else:
-                sr = detect_delimiter(_peek(plain))
-                df = pd.read_csv(
-                    plain, sep=sr[0],
-                    lineterminator=sr[1],
-                    index_col=0, on_bad_lines="skip",
-                )
+                if lower.endswith(".tsv"):
+                    df = pd.read_csv(
+                        plain, sep="\t",
+                        index_col=0, on_bad_lines="skip",
+                    )
+                elif lower.endswith(".csv"):
+                    df = pd.read_csv(
+                        plain, sep=",",
+                        index_col=0, on_bad_lines="skip",
+                    )          
+                else:          
+                    sr = detect_delimiter(_peek(plain))
+                    print(f"******{meta.filename}\n{sr}")
+
+                    df = pd.read_csv(
+                        plain, sep=sr[0],
+                        lineterminator=sr[1],
+                        index_col=0, on_bad_lines="skip",
+                    )
+
                 numeric_cols = df.select_dtypes(include=[np.number]).columns
                 df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, downcast="float")
  
@@ -1129,6 +1561,8 @@ def fetch_and_normalize(
     merged_gpl_data = {}
  
     all_selected_gpls = st.session_state.selected_gpl
+
+    logs_to_record = []
  
     def process_candidate(c):
         selected = [c]
@@ -1140,8 +1574,6 @@ def fetch_and_normalize(
             "normalization", "Normalization detected from source metadata.",
             norm_type=c.normalization, is_log=c.is_log
         )
- 
-        print(f"\n  Processing: {c.filename}")
  
         url_bytes = _download_all([c.url])
         dl_path = url_bytes.get(c.url)
@@ -1158,9 +1590,11 @@ def fetch_and_normalize(
         gc.collect()
  
         if counts_df.empty:
+            print("NARWHALS")
             return None
  
         if counts_df.size > MAX_MATRIX_CELLS:
+            print("NARWHALS 2.0")
             print(f"    Skipping {c.filename}: {counts_df.size:,} cells exceeds "
                   f"{MAX_MATRIX_CELLS:,}-cell limit")
             return None
@@ -1171,11 +1605,30 @@ def fetch_and_normalize(
             col for col in counts_df.columns
             if "gsm" not in col.lower() or any(gsm in col for gsm in gsm_ids)
         ]
- 
+
+        column_map = {}
+
+        if len(retained_cols) == len(gsm_ids): #make sure GSMs haven't been dropped and now we're misaligning everything
+            for i, col in enumerate(retained_cols):
+                if "gsm" in col:
+                    column_map[col] = col
+                else:
+                    column_map[col] = gsm_ids[i]
+                    logs_to_record.append(
+                        ("sample_column_mapping", "The supplementary file of this GSE had column names not corresponding to a GSM. " \
+                        "The columns were mapped assuming the first GSM is the first sample listed on NCBI GEO, and so on." \
+                        "If this is not the case, upstream data analysis will be compromised.",
+                        c.filename)
+                    )
+
         counts_df = counts_df[retained_cols]
+
+        counts_df = counts_df.rename(columns = column_map)
         counts_df.index.name = None
         counts_df.insert(0, "Name", counts_df.index)
         counts_df.reset_index(drop=True, inplace=True)
+
+        # print(f"******{c.filename}\n{counts_df.head}")
  
         cache_path = geo_cache_dir / f"{accession}_{c.filename}_{id(c)}.parquet"
         modified_path = geo_cache_dir / f"{accession}_{c.filename}_{id(c)}_modified.parquet"
@@ -1187,7 +1640,7 @@ def fetch_and_normalize(
         # cache.add(cache_path, buffer.getvalue())
         # cache.add(modified_path, buffer.getvalue())
 
-        counts_df.to_parquet(cache_path)
+        counts_df.to_parquet(cache_path, index=False)
         shutil.copy(cache_path, modified_path)
  
         meta_entry = {
@@ -1205,6 +1658,11 @@ def fetch_and_normalize(
  
  
     max_workers = min(4, len(candidates))
+
+    for log in logs_to_record:
+        log_record(
+            log[0], log[1], filename = log[2]
+        )
  
  
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1227,7 +1685,7 @@ def fetch_rnaseq_matrix(gse_id: str, meta):
     try:
         return fetch_and_normalize(
             accession=gse_id,
-            gsm_ids=meta["gsm_ids"],
+            gsm_ids=meta["all_gsm_ids"],
             geo_cache_dir="./geo_cache",
             save_output=False,
         )
@@ -1249,7 +1707,7 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
     if looks_like_symbols > 0.90:
         df.insert(0, "Name", df["_probe_id"])
         df = df.drop("_probe_id", axis=1)
-        st.session_state.gpl_data = {}
+        st.session_state.gpl_data = {st.session_state.selected_gpl[0]: [None, None, None]}
         return df
  
     NULL_VALUES = {"---", "na", "", "null", "nan"}
@@ -1262,7 +1720,7 @@ def _annotate_matrix(df: pd.DataFrame) -> pd.DataFrame:
         st.warning(f"{e} Keeping original probe IDs.")
         df.insert(0, "Name", df["_probe_id"])
         df = df.drop("_probe_id", axis=1)
-        st.session_state.gpl_data = {}
+        st.session_state.gpl_data = {st.session_state.selected_gpl[0]: [None, None, None]}
         return df
  
     master_mapping: dict[str, str] = {}
@@ -1312,12 +1770,12 @@ def fetch_microarray_matrix(meta: dict):
         norm_type=norm_info.norm_type, is_log=norm_info.is_log, source=norm_info.source,
     )
  
-    final_df = GLOBAL_GSE.pivot_samples(values="VALUE")[meta["gsm_ids"]]
+    final_df = GLOBAL_GSE.pivot_samples(values="VALUE")[meta["all_gsm_ids"]]
  
     print(f"Microarray matrix contains {len(final_df.columns)} samples.")
     final_df = _annotate_matrix(final_df)
     final_df = reduce_matrix_memory(final_df)
- 
+
     geo_cache_dir = Path("./geo_cache")
     geo_cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = geo_cache_dir / f"{gse_id}_microarray.parquet"
@@ -1330,7 +1788,7 @@ def fetch_microarray_matrix(meta: dict):
     # cache.add(cache_path, buffer.getvalue())
     # cache.add(modified_path, buffer.getvalue())
 
-    final_df.to_parquet(cache_path)
+    final_df.to_parquet(cache_path, index=False)
     shutil.copy(cache_path, modified_path)
  
     meta_entry = {
@@ -1347,32 +1805,7 @@ def fetch_microarray_matrix(meta: dict):
     return [meta_entry]
  
  
-def get_txt_gz_stream(parquet_path: str, columns):
-    temp_dir = tempfile.gettempdir()
-    output_path = os.path.join(temp_dir, f"export_{uuid.uuid4().hex}.txt.gz")
 
-    if columns:
-        if "Name" not in columns:
-            columns = ["Name"] + columns
-        cols_sql = ", ".join(f'"{c}"' for c in columns)
-        select_clause = f"SELECT {cols_sql} FROM '{parquet_path}'"
-    else:
-        select_clause = f"SELECT * FROM '{parquet_path}'"
-
-    duckdb.execute(f"""
-        COPY ({select_clause})
-        TO '{output_path}'
-        (FORMAT 'CSV', DELIMITER '\t', HEADER TRUE, COMPRESSION 'GZIP');
-    """)
-
-    try:
-        with open(output_path, "rb") as f:
-            data = f.read()
-    finally:
-        if os.path.exists(output_path):
-            os.remove(output_path)
-
-    return data
 
  
 _NUMERIC_EXTRACT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
@@ -1406,8 +1839,7 @@ def _auto_binary_map(unique_vals) -> Optional[dict]:
 # # # # # # # # # # # # # # # #
 # USER INTERFACE  # # # # # # #
 # # # # # # # # # # # # # # # #
- 
-@st.fragment
+
 def survival_metadata_ui(char_df):
     if char_df.empty or not len(char_df.columns):
         st.info("No sample characteristics are available for time-to-event data.")
@@ -1416,17 +1848,30 @@ def survival_metadata_ui(char_df):
     if "survival_df" not in st.session_state:
         st.session_state.survival_df = pd.DataFrame(index=char_df.index)
         st.session_state.survival_df["GSM"] = char_df.index
- 
-    with st.expander("Generate Time-to-Event Data"):
+    
+    with st.expander("Generate Time-to-Event Data [OPTIONAL]", key = "purple_expander"):
         st.write("Preview of characteristics data (taken from NCBI GEO)")
         st.dataframe(
             char_df.head(),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
+
+        default = 0
+        
+        for i in range(len(char_df.columns)):
+            unique_vals = sorted(list(char_df[list(char_df.columns)[i]].dropna().unique()))
+            if len(unique_vals) == 2 or len(unique_vals) == 3:
+                default = i
+                break
+        
+        st.markdown("##### Event Column Selection")
+        st.markdown("Use the selector below to pick which metadata attribute represents the event.")
+
         mortality = st.selectbox(
             "Event column",
             options=list(char_df.columns),
+            index = default,
             key="survival_mortality_col"
         )
  
@@ -1445,6 +1890,9 @@ def survival_metadata_ui(char_df):
                     key=f"alive_dead_{i}"
                 )
             st.session_state.survival_df["death"] = char_df[mortality].map(mapping)
+
+        st.markdown("##### Time-to-Event Column Selection")
+        st.markdown("Use the selector below to pick which metadata attribute represents the time to the event.")
  
         t_mortality = st.selectbox(
             "Time to event column",
@@ -1477,7 +1925,7 @@ def survival_metadata_ui(char_df):
  
         st.dataframe(
             st.session_state.survival_df.head(),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
  
@@ -1490,292 +1938,23 @@ def survival_metadata_ui(char_df):
             mime="text/plain",
         )
 
-import os
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import pyarrow.parquet as pq
-import pyarrow.types as pt
-import streamlit as st
-from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_score
-
-MAX_ROWS_FOR_QC = 5000
-SILHOUETTE_WARNING = 0.5
-
-
-def _load_numeric(source_path):
-    schema = get_schema(source_path)
-    numeric_cols = [
-        f.name for f in schema
-        if pt.is_integer(f.type) or pt.is_floating(f.type)
-    ]
-
-    return get_parquet(source_path, columns = numeric_cols).to_pandas().astype(np.float32)
-
-
-def _factor_labels(char_df, col, samples):
-    lookup = char_df[col]
-    lookup = lookup[~lookup.index.duplicated(keep="first")]
-    return pd.Series(samples, index=samples).map(lookup).fillna("NA").astype(str)
-
-
-@st.cache_data(show_spinner="PCA and RLE Loading")
-def compute_microarray_qc(source_path, char_df, raw = False):
-    source_df = _load_numeric(source_path)
-    if raw:
-            source_df = source_df[(source_df >= 10).sum(axis=1) >= 3]          
-            cpm = source_df / source_df.sum(axis=0) * 1e6           
-            logcpm = np.log2(cpm + 1)                               
-            top = logcpm.var(axis=1).nlargest(1000).index 
-            X = logcpm.loc[top].T
-
-    if source_df.max().max() > 100: 
-        source_df = np.log2(source_df.clip(lower=0) + 1)
-
-        st.warning("Existing data was likely linearly scaled, so for PCA and RLE purposes it has been log scaled.")
-
-    if not raw:
-        X = source_df.T
-        X = X.fillna(X.mean()).dropna(axis=1)
-
-    pca = PCA(n_components=2, svd_solver="randomized", random_state=0)
-    pcs = pca.fit_transform(X)
-    pca_base = pd.DataFrame(pcs, columns=["PC1", "PC2"], index=X.index)
-    pca_base["Sample"] = pca_base.index
-    var_explained = pca.explained_variance_ratio_ * 100
-
-    if len(source_df) > MAX_ROWS_FOR_QC:
-        source_df = source_df.sample(MAX_ROWS_FOR_QC, random_state=0)
-    deviation_df = source_df.sub(source_df.median(axis=1), axis=0)
-    box_df = deviation_df.melt(var_name="Sample", value_name="Deviation")
-
-    silhouettes = {}
-    for col in char_df.columns:
-        labels = _factor_labels(char_df, col, pca_base["Sample"])
-        if 1 < labels.nunique() < len(labels):
-            silhouettes[col] = silhouette_score(pcs, labels)
-
-    return pca_base, var_explained, box_df, silhouettes
-
-
-@st.cache_data(show_spinner="Sequencing Depth Loading ")
-def compute_depth(source_path):
-    source_df = _load_numeric(source_path)
-    return pd.DataFrame({"Sample": source_df.columns, "Depth": source_df.sum(axis=0).values})
-
-
-
-
-def qc(char_df, gse_id, source_path, modified_path, normalization_type, selected_columns):
-    with st.expander("Quality Control", expanded=False):
-        st.session_state["selected_columns_for_download"] = selected_columns
-        selected = set(selected_columns)
-
-        depth_df = None
-
-        if "microarray" in str(source_path):
-            pca_base, var_explained, box_df, silhouettes = compute_microarray_qc(
-                str(source_path), char_df
-            )
-
-            best_col = max(silhouettes, key=silhouettes.get) if silhouettes else char_df.columns[0]
-
-            st.markdown(
-                "#### Sample PCA\n"
-                "Each point is one sample. Samples with similar gene expression sit close together. "
-                "Use this to spot **outliers** (points far from everything else) that may be bad "
-                "samples worth removing."
-            )
-            color_col = st.selectbox(
-                "Varied Factor (color the samples by...)",
-                char_df.columns,
-                list(char_df.columns).index(best_col),
-                key=f"qc_rle_selector",
-                help="Defaults to the factor that best separates samples on the PCA.",
-            )
-
-            pca_df = pca_base.copy()
-            pca_df[color_col] = _factor_labels(char_df, color_col, pca_df["Sample"]).values
-            pca_df["Status"] = np.where(
-                pca_df["Sample"].isin(selected), "Kept", "Removed"
-            )
-
-            score = silhouettes.get(color_col)
-            if score is not None and score > SILHOUETTE_WARNING:
-                st.warning(
-                    f"Samples separate very strongly by **{color_col}** "
-                    f"(silhouette score = {score:.2f}). If this factor is not a real biological "
-                    "difference (e.g. a processing date, platform, or lab), there is a strong "
-                    "potential for **batch effects**. Consider correcting for it before "
-                    "comparing groups."
-                )
-
-            n_removed = int((pca_df["Status"] == "Removed").sum())
-            st.caption(
-                f"Circle = sample kept (will be in your download)   |   "
-                f"X = sample removed (excluded from your download)   |   "
-                f"{len(pca_df) - n_removed} kept, {n_removed} removed"
-                + (f"   |   Silhouette for '{color_col}': {score:.2f} "
-                   "(-1 to 1; higher = groups are more distinct)" if score is not None else "")
-            )
-
-
-            pca_fig = px.scatter(
-                pca_df,
-                x="PC1",
-                y="PC2",
-                color=color_col,
-                symbol="Status",
-                symbol_map={"Kept": "circle", "Removed": "x"},
-                hover_name="Sample",
-                labels={
-                    "PC1": f"PC1 ({var_explained[0]:.1f}% of variance)",
-                    "PC2": f"PC2 ({var_explained[1]:.1f}% of variance)",
-                },
-                title="Sample PCA",
-            )
-            pca_fig.update_traces(marker=dict(size=10))
-            st.plotly_chart(pca_fig, key=f"qc_pca")
-
-            st.markdown(
-                "#### Relative Log Expression (RLE)\n"
-                "Each box shows how far one sample's genes deviate from the typical (median) "
-                "gene value of each gene in the sample. In a healthy dataset, boxes are **centered near 0 and roughly the "
-                "same height**. A box that is shifted up/down or much wider than the rest may "
-                "be a low-quality sample or a batch difference."
-            )
-            box_df = box_df.copy()
-            box_df[color_col] = box_df["Sample"].map(
-                dict(zip(pca_df["Sample"], pca_df[color_col]))
-            )
-            box_df = box_df.sort_values(by=color_col)
-
-            fig = px.box(box_df, x="Sample", y="Deviation", color=color_col, points=False)
-            st.plotly_chart(fig, key=f"qc_plot")
-
-            qc_summary_df = pca_df[["Sample", color_col, "Status"]].rename(
-                columns={color_col: "colored_by"}
-            )
-            if normalization_type == "raw_counts" and depth_df is not None:
-                qc_summary_df = qc_summary_df.merge(
-                    depth_df[["Sample", "Depth"]], on="Sample", how="left"
-                )
-
-            st.download_button(
-                label="⬇ Download QC summary (.csv)",
-                data=qc_summary_df.to_csv(index=False),
-                file_name=f"{gse_id}_qc_summary.csv",
-                mime="text/csv",
-                key="download_qc_summary",
-            )
-
-        else:
-            if normalization_type == "raw_counts":
-                pca_base, var_explained, box_df, silhouettes = compute_microarray_qc(
-                    str(source_path), char_df, raw=True
-                )
-            else:
-                pca_base, var_explained, box_df, silhouettes = compute_microarray_qc(
-                    str(source_path), char_df, raw=True
-                )
-
-            best_col = max(silhouettes, key=silhouettes.get) if silhouettes else char_df.columns[0]
-
-            st.markdown(
-                "#### Sample PCA\n"
-                "Each point is one sample. Samples with similar gene expression sit close together. "
-                "Use this to spot **outliers** (points far from everything else) that may be bad "
-                "samples worth removing."
-            )
-            color_col = st.selectbox(
-                "Varied Factor (color the samples by...)",
-                char_df.columns,
-                list(char_df.columns).index(best_col),
-                key=f"qc_rle_selector",
-                help="Defaults to the factor that best separates samples on the PCA.",
-            )
-
-            pca_df = pca_base.copy()
-            pca_df[color_col] = _factor_labels(char_df, color_col, pca_df["Sample"]).values
-            pca_df["Status"] = np.where(
-                pca_df["Sample"].isin(selected), "Kept", "Removed"
-            )
-
-            score = silhouettes.get(color_col)
-            if score is not None and score > SILHOUETTE_WARNING:
-                st.warning(
-                    f"Samples separate very strongly by **{color_col}** "
-                    f"(silhouette score = {score:.2f}). If this factor is not a real biological "
-                    "difference (e.g. a processing date, platform, or lab), there is a strong "
-                    "potential for **batch effects**. Consider correcting for it before "
-                    "comparing groups."
-                )
-
-            n_removed = int((pca_df["Status"] == "Removed").sum())
-            st.caption(
-                f"Circle = sample kept (will be in your download)   |   "
-                f"X = sample removed (excluded from your download)   |   "
-                f"{len(pca_df) - n_removed} kept, {n_removed} removed"
-                + (f"   |   Silhouette for '{color_col}': {score:.2f} "
-                   "(-1 to 1; higher = groups are more distinct)" if score is not None else "")
-            )
-
-
-            pca_fig = px.scatter(
-                pca_df,
-                x="PC1",
-                y="PC2",
-                color=color_col,
-                symbol="Status",
-                symbol_map={"Kept": "circle", "Removed": "x"},
-                hover_name="Sample",
-                labels={
-                    "PC1": f"PC1 ({var_explained[0]:.1f}% of variance)",
-                    "PC2": f"PC2 ({var_explained[1]:.1f}% of variance)",
-                },
-                title="Sample PCA",
-            )
-            pca_fig.update_traces(marker=dict(size=10))
-            st.plotly_chart(pca_fig, key=f"qc_pca")
-
-            
-
-            if normalization_type == "raw_counts":
-                depth_df = compute_depth(str(source_path))
-                depth_df["Status"] = np.where(
-                    depth_df["Sample"].isin(selected), "Kept", "Removed"
-                )
-                st.markdown(
-                    "#### Sequencing Depth\n"
-                    "Total reads per sample. Samples below the dashed line (20 million reads) have "
-                    "less data, so their gene measurements are noisier and less reliable. "
-                    "Works only for raw counts."
-                )
-                fig = px.bar(
-                    depth_df, x="Sample", y="Depth",
-                    labels={"Depth": "Total reads"},
-                    color = "Status",
-                    color_discrete_map = {
-                            "Kept": "blue",      
-                            "Removed": "yellow"      
-                        }
-
-                )
-                fig.add_hline(
-                    y=20e6,
-                    line_dash="dash",
-                    line_color="black",
-                    annotation_text="20M reads",
-                )
-                st.plotly_chart(fig, key=f"qc_plot")
-
-        
 
 
 @st.fragment
 def annotate_columns(i, char_df, gse_id, source_path, modified_path):
-    with st.expander("Annotate Columns", expanded=False):
+    st.markdown(
+        f"""
+        <style>
+            .st-key-purple_annot_expander_{i} {{
+                border-radius: 8px;
+                color: rgb(101, 68, 163);
+                background-color: rgba(35, 25, 195, 0.10);
+            }}
+        </style>
+        """, unsafe_allow_html=True
+    )
+
+    with st.expander("Annotate Columns", expanded=False, key = f"purple_annot_expander_{i}"):
         st.write("Replace GSM column names with sample data")
  
         st.pills("Annotate by:", char_df.columns, selection_mode="multi", key=f"pill_selector_{i}")
@@ -1827,83 +2006,9 @@ def annotate_columns(i, char_df, gse_id, source_path, modified_path):
             st.session_state[f"selected_cols_dict_{gse_id}_{i}"]["Name"] = True
             st.rerun(scope="app")
  
-@st.fragment
-def column_selector(counts_path, i, gse_id, state, suffix):
-    parquet_file = pq.ParquetFile(counts_path)
-    all_columns = parquet_file.schema.names
 
-    state_key = f"selected_cols_dict_{gse_id}_{state}_{suffix}"
-    if state_key not in st.session_state:
-        st.session_state[state_key] = {col: True for col in all_columns}
 
-    st.markdown("### Select Columns to Include in Download \n" \
-    "You can search for specific columns using the search bar below. Uncheck any columns you wish to exclude from your download." \
-    "You can use the Quality Control data below to inform your column selections.")
-    search_term = st.text_input("Search columns", key=f"search_bar_{i}_{suffix}")
 
-    filtered_columns = [
-        col for col in all_columns
-        if search_term.lower() in col.lower()
-    ] if search_term else list(all_columns)
-
-    def select_all():
-        for col in filtered_columns:
-            st.session_state[state_key][col] = True
-            st.session_state[f"ui_{col}_{i}_{suffix}_key"] = True
-        st.session_state["_force_full_rerun"] = True 
-
-    def deselect_all():
-        for col in filtered_columns:
-            st.session_state[state_key][col] = False
-            st.session_state[f"ui_{col}_{i}_{suffix}_key"] = False
-        st.session_state["_force_full_rerun"] = True 
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.button("Select All", on_click=select_all, key=f"select_all_{i}_{suffix}")
-    with col2:
-        st.button("Deselect All", on_click=deselect_all, key=f"deselect_all_{i}_{suffix}")
-
-    with st.expander("Show All Columns", expanded=False):
-        num_grid_cols = 4
-        grid_columns = st.columns(num_grid_cols)
-
-        for idx, col in enumerate(filtered_columns):
-            def update_single_col(c=col):
-                st.session_state[state_key][c] = st.session_state[f"ui_{c}_{i}_{suffix}_key"]
-                st.session_state["_force_full_rerun"] = True 
-        
-
-            widget_key = f"ui_{col}_{i}_{suffix}_key"
-
-            if col not in st.session_state[state_key]:
-                st.session_state[state_key][col] = True
-
-            st.session_state[widget_key] = st.session_state[state_key][col]
-
-            with grid_columns[idx % num_grid_cols]:
-                st.checkbox(
-                    col,
-                    key=widget_key,
-                    on_change=update_single_col
-                )
-
-    selected_columns = [
-        col for col in all_columns
-        if st.session_state[state_key].get(col, True)
-    ]
-
-    return selected_columns
-
-def get_parquet(path, **kwargs):
-    # reader = pa.BufferReader(cache.get(path))
-    # return pq.read_table(reader, **kwargs)
-    return pq.read_table(path, **kwargs)
-
-def get_schema(path, **kwargs):
-    # reader = pa.BufferReader(cache.get(path))
-    # return pq.read_schema(reader, **kwargs)
-    return pq.read_schema(path, **kwargs)
  
 def apply_norm(modified_path, norm, col_list, i, source_path):
     target_cols = set(col_list)
@@ -1911,7 +2016,8 @@ def apply_norm(modified_path, norm, col_list, i, source_path):
     schema = get_schema(modified_path)
     base_schema = get_schema(source_path)
     base_column_set = set(base_schema.names)
- 
+
+    
     numeric_cols = [
         field.name for field in schema
         if (pt.is_integer(field.type) or pt.is_floating(field.type)) and field.name in target_cols
@@ -2010,137 +2116,6 @@ def apply_norm(modified_path, norm, col_list, i, source_path):
 if "result_lists" not in st.session_state:
     st.session_state.result_lists = None
 
-@st.dialog("Download Data", width="large")
-def download_dialog():
-    if st.session_state.result_lists is not None:
-        result_lists = st.session_state.result_lists
-        current_norms = []
-        for i in range(len(result_lists)):
-            current_norms.append(st.session_state.get(f"norm_type_{i}", "none"))
-        def prep_download(i, meta_entry, columns = None):
-            current_norm = current_norms[i]
-            norm_suffix = f"_{current_norm}" if current_norm != "none" else ""
-            return (f"download_{i}", get_txt_gz_stream((meta_entry["modified_path"]), 
-                                                        columns = columns), f"{gse_id}_{meta_entry['normalization_type']}{norm_suffix}.txt.gz",
-                                                        meta_entry)
-
-        select_dict = {}
-        for i, meta_entry in enumerate(result_lists):
-            select_dict[meta_entry["modified_path"]] = (i, meta_entry)
-
-        selected_path = st.selectbox(
-            "Which dataset would you like to download?",
-            options = [x["modified_path"] for x in result_lists],
-            key = "selected_path_for_download"
-        )
-
-        selected_columns = column_selector(
-            selected_path, "download", gse_id, "qc", selected_path
-        )
-
-        char_df = st.session_state.char_df.copy()
-        gsm_filter = []
-        for g in list(st.session_state.current_gpl.keys()):
-            if g != "ncbi":
-                gsm_filter.extend(meta["gsm_gpl_dict"][g])
-        if not gsm_filter:
-            gsm_filter = meta["gsm_ids"]
-
-        
-        res = prep_download(select_dict[st.session_state["selected_path_for_download"]][0], select_dict[st.session_state["selected_path_for_download"]][1],
-                            columns = selected_columns)
-        if res is not None:
-            # signature = st.text_area(
-            #     "Paste signature to check availability (any punctuation okay)"
-            # )
-
-            # signature_list = re.split(r'[;,\s]', signature)
-
-            # signature_set = set([s.strip() for s in signature_list if s.strip()])
-
-
-            # if signature_set:
-            #     hngc_data = fetch_hgnc_table()
-            #     df = pq.read_table(meta_entry["modified_path"], columns=["Name"]).to_pandas()
-            #     available_genes = set(df["Name"].dropna().unique())
-            #     print(list(available_genes)[:10])
-
-            #     signature_set_symbol = signature_set.intersection(set(hngc_data["symbol"].dropna().unique()))
-            #     signature_set_alias = signature_set.intersection(set(hngc_data["alias_symbol"].dropna().unique()))
-            #     signature_set_prev = signature_set.intersection(set(hngc_data["prev_symbol"].dropna().unique()))
-            #     missing_genes_symbol = signature_set_symbol - available_genes
-            #     missing_genes_alias = signature_set_alias - available_genes
-            #     missing_genes_prev = signature_set_prev - available_genes
-
-            #     print(missing_genes_symbol.intersection(missing_genes_alias).intersection(missing_genes_prev))
-
-            #     if intersection := missing_genes_symbol.intersection(missing_genes_alias).intersection(missing_genes_prev):
-                    
-            #         st.warning(
-            #             f"{len(intersection)} gene(s) from your signature were not found in this dataset: "
-            #             + ", ".join(list(intersection)[:10]) + ("..." if len(intersection) > 10 else "")
-            #         )
-
-            #         log_record(
-            #             "signature_check", "User checked signature against dataset.",
-            #             missing_genes=list(intersection),
-            #         )
-            #     else:
-            #         st.success("All genes from your signature are present in this dataset.")
-
-            qc_meta_entry = res[3]
-            qc(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, qc_meta_entry["path"], qc_meta_entry["modified_path"], qc_meta_entry["normalization_type"], selected_columns)
-            if st.session_state.get("_force_full_rerun"):
-                st.session_state["_force_full_rerun"] = False
-                st.rerun()
-
-            st.markdown("### Download Dataset \n" \
-            "Click the button below to download the dataset as a tab-separated text file. The file will be compressed using gzip to reduce download size.")
-
-            st.download_button(
-                label="Download Dataset ⬇",
-                key=res[0],
-                data=res[1],
-                file_name=res[2],
-                mime="application/gzip",
-            )
-
-        if st.session_state.get("record_log"):
-
-            st.markdown("### Download Provenance Record \n" \
-            "Click the button below to download a JSON file containing a record of the actions taken during the analysis. This can be used for reproducibility and tracking of the analysis steps.")
-
-            record_payload = {
-                "gse_id": gse_id,
-                "accessed": datetime.now(timezone.utc).isoformat(),
-                "tool_version": "geo-2-compass-0.1", 
-                "events": st.session_state.record_log,
-            }
-            st.download_button(
-                label="⬇ Download provenance (.json)",
-                data=json.dumps(record_payload, indent=2, default=str),
-                file_name=f"{gse_id}_record.json",
-                mime="application/json",
-                key="download_record",
-            )
-
-
-    else:
-        st.info("No results available yet.")
-
-c1, c2 = st.columns(2)
-with c1:
-    if st.button("Fetch & Build Matrix", type="primary"):
-        st.session_state.run_pipeline = True
-        st.session_state.result_lists = None
-    
-        for key in list(st.session_state.keys()):
-            if str(key).startswith(("df_", "base_df_", "norm_type_", "preview_", "selected_cols_dict_", "pill_selector_")):
-                del st.session_state[key]
-        gc.collect()
-with c2:
-    if st.button("Download Data", type = "primary"):
-        download_dialog()
 
         
  
@@ -2163,187 +2138,299 @@ if st.session_state.run_pipeline and st.session_state.result_lists is None:
             st.stop()
         st.session_state.result_lists = result_lists
         status.update(label="Done!", state="complete")
- 
-if st.session_state.result_lists is not None:
-    result_lists = st.session_state.result_lists
- 
-    st.session_state.current_gpl = select_gpl(st.session_state.gpl_data)
- 
-    char_df = st.session_state.char_df.copy()
 
- 
-    gsm_filter = []
+char_df = st.session_state.char_df.copy()
+gsm_filter = []
     
-    for g in list(st.session_state.current_gpl.keys()):
-        if g != "ncbi":
-            gsm_filter.extend(meta["gsm_gpl_dict"][g])
+for g in list(st.session_state.current_gpl.keys()):
+    if g != "ncbi":
+        gsm_filter.extend(meta["gsm_gpl_dict"][g])
 
-    if not gsm_filter:
-        gsm_filter = meta["gsm_ids"]
- 
-    survival_metadata_ui(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")])
+if not gsm_filter:
+    gsm_filter = meta["gsm_ids"]
+survival_metadata_ui(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")])
+
+file_names, file_view = st.columns([1, 4])
 
 
-    qc_meta_entry = result_lists[0]
+def _short_name(entry, max_len=26):
+    name = entry["filename"].removeprefix(f"{gse_id}_")
+    name = re.sub(r"\.(txt|csv|tsv|tab|xlsx?)(\.gz)?$", "", name, flags=re.I)
+    return name if len(name) <= max_len else name[: max_len - 1] + "…"
 
-    for i, meta_entry in enumerate(result_lists):
-        if meta_entry["normalization_type"] == "raw_counts":
-            qc_meta_entry = meta_entry
+def _set_active_dataset(idx):
+    st.session_state["active_dataset_idx"] = idx
 
-    # qc(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, qc_meta_entry["path"], qc_meta_entry["modified_path"], qc_meta_entry["normalization_type"])
-    st.markdown("""
-        <style>
-            .normalization {
-                font-size: 16px !important;
-                background-color: #FFCCCC; /* Light red */
-                border: 2px rgb(255, 75, 75) solid;
-                text-align: center;
-                color: #000000;
-                padding: 0.25rem 0.75rem;
-                margin-left: 10%;
-                margin-right: 10%;
-                border-radius: 0.375rem 0.375rem 0 0;
-            }
- 
-            .container {
-                padding: 0;
-                border-radius: 0.5rem;
-                border: 2px rgba(100, 100, 100, 0.2) solid;
-            }
- 
-            .normtext {
-                padding: 0.5rem;
-                font-size: 16px !important;
-                text-align: center;
-            }
- 
-        </style>
-        """, unsafe_allow_html=True)
- 
-    for i, meta_entry in enumerate(result_lists):
-        if f"norm_type_{i}" not in st.session_state:
-            st.session_state[f"norm_type_{i}"] = "none"
- 
- 
-        original_normalization = meta_entry["normalization_type"]
-        n_genes = meta_entry["n_genes"]
-        n_samples = meta_entry["n_samples"]
- 
-        st.markdown(body="<hr>", unsafe_allow_html=True)
-        st.caption(f"**{meta_entry['filename']}**")
-        c4, c5 = st.columns(2)
-        with c4:
-            st.markdown(body=f'<div class="container"><p class="normalization">Original Normalization</p> <p class="normtext">{original_normalization}</p></div>', unsafe_allow_html=True)
-        with c5:
-            st.markdown(body=f'<div class="container"><p class="normalization">Applied Normalization</p> <p class="normtext">{st.session_state[f"norm_type_{i}"].upper()}</p></div>', unsafe_allow_html=True)
- 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Genes", f"{n_genes:,}")
-        c2.metric("Samples", len(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")]))
+NAV_CSS = """
+<style>
+.st-key-dataset_nav { gap: 0.15rem; color: rgb(101, 68, 163); }
 
-        print(gsm_filter)
-        
-        annotate_columns(i, char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, meta_entry["path"], meta_entry["modified_path"])
- 
-        with st.expander("Change Normalization", expanded=False):
-            st.write(st.session_state["dp_text"])
-            is_log = meta_entry.get("is_log", False)
-            st.write("What normalization would you like to apply?")
-            if original_normalization == "raw_counts":
-                norm_suggestion = f"log2 or log2(cpm+1) because {original_normalization} data is raw."
-            elif is_log:
-                norm_suggestion = f"None because {original_normalization} already log-scales the data."
-            else:
-                norm_suggestion = f"log2 because {original_normalization} is linearly scaled, potentially leading to a skewed distribution."
- 
-            st.radio(
-                label=f"Suggestion: {norm_suggestion}",
-                options=("none", "log2", "log10", "cpm", "log2(cpm+1)", "log10(cpm+1)"),
-                key=f"norm_type_{i}"
-            )
- 
-            st.write("Which columns would you like to apply it to?")
-            st.session_state[f"selected_columns_{i}"] = column_selector(meta_entry["modified_path"], i, gse_id, "annotator", str(meta_entry["modified_path"]) + "&")
- 
-            submit_button = st.button(label="Renormalize", key=f"renormalize_{i}")
- 
-            if submit_button:
-                modified_df = apply_norm(
-                    meta_entry["modified_path"],
-                    st.session_state[f"norm_type_{i}"],
-                    st.session_state[f"selected_columns_{i}"],
-                    i,
-                    meta_entry["path"]
+.st-key-dataset_nav button {
+    width: 100%;
+    justify-content: flex-start;
+    text-align: left;
+    background: transparent;
+    color: inherit;
+    border: none;
+    border-left: 3px solid transparent;
+    border-radius: 0 0.4rem 0.4rem 0;
+    box-shadow: none;
+    padding: 0.45rem 0.75rem;
+    min-height: 0;
+}
+.st-key-dataset_nav button p {
+    text-align: left;
+    font-size: 0.9rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* hover */
+.st-key-dataset_nav button:hover {
+    background: rgb(213, 212, 229);
+    color: inherit;
+}
+
+.st-key-dataset_nav button[data-testid="stBaseButton-primary"] {
+    border-left-color: rgb(101, 68, 163);
+    background: rgba(35, 25, 195, 0.10);
+    color: inherit;
+    font-weight: 600;
+}
+.st-key-dataset_nav button[data-testid="stBaseButton-primary"] p {
+    font-weight: 600;
+}
+</style>
+"""
+
+
+with file_names:
+    if st.session_state.result_lists is not None:
+        result_lists = st.session_state.result_lists
+        st.markdown(NAV_CSS, unsafe_allow_html=True)
+
+        if st.session_state.get("active_dataset_idx", 0) >= len(result_lists):
+            st.session_state["active_dataset_idx"] = 0
+        active = st.session_state.setdefault("active_dataset_idx", 0)
+
+        st.markdown("**NCBI Supplementary Files**")
+        with st.container(key="dataset_nav"):
+            for idx, entry in enumerate(result_lists):
+                st.button(
+                    _short_name(entry),
+                    key=f"nav_btn_{idx}",
+                    type="primary" if idx == active else "secondary",
+                    help=entry["filename"],        
+                    on_click=_set_active_dataset,
+                    args=(idx,),
+                    use_container_width=True,
                 )
 
-                log_record(
-                    "normalization", "User applied a renormalization.",
-                    applied=st.session_state[f"norm_type_{i}"],
-                    original=original_normalization,
-                    n_columns=len(st.session_state[f"selected_columns_{i}"]),
-                )
- 
-                pq.write_table(
-                    modified_df,
-                    meta_entry["modified_path"],
-                    compression="snappy"
-                )
- 
- 
- 
-        # Live view of the CURRENT df_key — reflects annotate/renormalize immediately
-        parquet_file = pq.ParquetFile(meta_entry["modified_path"])
-        total_rows = parquet_file.metadata.num_rows
-        schema_names = parquet_file.schema.names
- 
-        gsm_filter = {
-            gsm
-            for g in st.session_state.current_gpl.keys()
-            for gsm in meta.get("gsm_gpl_dict", {}).get(g, [])
-        }
-
-        if gsm_filter == set():
-            gsm_filter = set(meta.get("gsm_ids", []))
- 
-        all_cols = []
-        for col in schema_names:
-            if "GSM" not in col.upper():
-                all_cols.append(col)
-            else:
-                match = re.search(r"GSM\d+", col, re.IGNORECASE)
-                if match and match.group(0).upper() in gsm_filter:
-                    all_cols.append(col)
-        total_cols = len(all_cols)
- 
-        if "Name" in all_cols[:PREVIEW_COLUMNS]:
-            preview_cols = all_cols[:PREVIEW_COLUMNS]
-        else:
-            preview_cols = ["Name"] + all_cols[:PREVIEW_COLUMNS-1]
- 
-        if total_rows > PREVIEW_ROWS or total_cols > PREVIEW_COLUMNS:
+        sel = result_lists[active]
+        with st.container(border = True):
             st.caption(
-                f"Showing {min(total_rows, PREVIEW_ROWS):,}/{total_rows:,} rows and "
-                f"{len(preview_cols):,}/{total_cols:,} columns. The download contains the complete matrix."
+                f"*Genes*: {sel['n_genes']:,}  \n"
+                f"*Samples*: {sel['n_samples']:,}  \n"
+                f"*Normalization*: `{sel['normalization_type']}`"
             )
- 
-        dataset = ds.dataset(meta_entry["modified_path"], format="parquet")
-        preview_table = dataset.head(PREVIEW_ROWS, columns=preview_cols)
- 
-        st.dataframe(
-            preview_table.to_pandas(),
-            use_container_width=True,
-            hide_index=True,
-            column_config={"Name": st.column_config.TextColumn("Name", pinned=True, width="small")},
-        )
- 
- 
-        current_norm = st.session_state.get(f"norm_type_{i}", "none")
-        norm_suffix = f"_{current_norm}" if current_norm != "none" else ""
- 
-        # st.download_button(
-        #     label="⬇ Download complete matrix (.txt.gz)",
-        #     key=f"download_{i}",
-        #     data=StreamWrapper(stream_parquet_to_tsv_gz(meta_entry["modified_path"])),
-        #     file_name=f"{gse_id}_{original_normalization}{norm_suffix}.txt.gz",
-        #     mime="application/gzip",
-        # )
+
+
+with file_view:
+    if st.session_state.result_lists is not None:
+        result_lists = st.session_state.result_lists
+    
+        st.session_state.current_gpl = select_gpl(st.session_state.gpl_data)
+    
+        char_df = st.session_state.char_df.copy()
+
+    
+        gsm_filter = []
+        
+        for g in list(st.session_state.current_gpl.keys()):
+            if g != "ncbi":
+                gsm_filter.extend(meta["gsm_gpl_dict"][g])
+
+        if not gsm_filter:
+            gsm_filter = meta["gsm_ids"]
+    
+
+
+
+        qc_meta_entry = result_lists[0]
+
+        for i, meta_entry in enumerate(result_lists):
+            if i != st.session_state.get("active_dataset_idx", 0):
+                continue
+            if meta_entry["normalization_type"] == "raw_counts":
+                qc_meta_entry = meta_entry
+
+            # qc(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, qc_meta_entry["path"], qc_meta_entry["modified_path"], qc_meta_entry["normalization_type"])
+            st.markdown("""
+                <style>
+                    .normalization {
+                        font-size: 16px !important;
+                        background-color: rgba(35, 25, 195, 0.10);
+                        border: 2px rgb(101, 68, 163) solid;
+                        text-align: center;
+                        color: rgb(101, 68, 163);
+                        padding: 0.25rem 0.75rem;
+                        margin-left: 10%;
+                        margin-right: 10%;
+                        border-radius: 0.375rem 0.375rem 0 0;
+                    }
+
+                    .container {
+                        padding: 0;
+                        border-radius: 0.5rem;
+                        border: 2px rgba(100, 100, 100, 0.2) solid;
+                    }
+
+                    .normtext {
+                        padding: 0.5rem;
+                        font-size: 16px !important;
+                        text-align: center;
+                    }
+
+                </style>
+                """, unsafe_allow_html=True)
+
+        for i, meta_entry in enumerate(result_lists):
+            if i != st.session_state.get("active_dataset_idx", 0):
+                continue
+            if f"norm_type_{i}" not in st.session_state:
+                st.session_state[f"norm_type_{i}"] = "none"
+
+
+            original_normalization = meta_entry["normalization_type"]
+            n_genes = meta_entry["n_genes"]
+            n_samples = meta_entry["n_samples"]
+
+            st.markdown(body="<hr>", unsafe_allow_html=True)
+            st.caption(f"**{meta_entry['filename']}**")
+            c4, c5 = st.columns(2)
+            with c4:
+                st.markdown(body=f'<div class="container"><p class="normalization">Original Normalization</p> <p class="normtext">{original_normalization}</p></div>', unsafe_allow_html=True)
+            with c5:
+                st.markdown(body=f'<div class="container"><p class="normalization">Applied Normalization</p> <p class="normtext">{st.session_state[f"norm_type_{i}"].upper()}</p></div>', unsafe_allow_html=True)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Genes", f"{n_genes:,}")
+            c2.metric("Samples", len(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")]))
+
+            annotate_columns(i, char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], gse_id, meta_entry["path"], meta_entry["modified_path"])
+
+            st.markdown(
+                f"""
+                <style>
+                    .st-key-purple_norm_expander_{i} {{
+                        border-radius: 8px;
+                        color: rgb(101, 68, 163);
+                        background-color: rgba(35, 25, 195, 0.10);
+                    }}
+                </style>
+                """, unsafe_allow_html=True
+            )
+
+            with st.expander("Change Normalization", expanded=False, key = f"purple_norm_expander_{i}"):
+                st.write(st.session_state["dp_text"])
+                is_log = meta_entry.get("is_log", False)
+                st.write("What normalization would you like to apply?")
+                if original_normalization == "raw_counts":
+                    norm_suggestion = f"log2 or log2(cpm+1) because {original_normalization} data is raw."
+                else:
+                    norm_suggestion = "none"
+
+                st.radio(
+                    label=f"Suggestion: {norm_suggestion}",
+                    options=("none", "log2", "log10", "cpm", "log2(cpm+1)", "log10(cpm+1)"),
+                    key=f"norm_type_{i}"
+                )
+
+                # st.write("Which columns would you like to apply it to?")
+                st.session_state[f"selected_columns_{i}"] = pq.ParquetFile(meta_entry["modified_path"]).schema.names
+
+                # column_selector(meta_entry["modified_path"], i, gse_id, "annotator", str(meta_entry["modified_path"]) + "&")
+
+                submit_button = st.button(label="Renormalize", key=f"renormalize_{i}")
+
+                if submit_button:
+                    modified_df = apply_norm(
+                        meta_entry["modified_path"],
+                        st.session_state[f"norm_type_{i}"],
+                        st.session_state[f"selected_columns_{i}"],
+                        i,
+                        meta_entry["path"]
+                    )
+
+                    log_record(
+                        "normalization", "User applied a renormalization.",
+                        applied=st.session_state[f"norm_type_{i}"],
+                        original=original_normalization,
+                        n_columns=len(st.session_state[f"selected_columns_{i}"]),
+                    )
+
+                    pq.write_table(
+                        modified_df,
+                        meta_entry["modified_path"],
+                        compression="snappy"
+                    )
+
+
+
+            # Live view of the CURRENT df_key — reflects annotate/renormalize immediately
+            parquet_file = pq.ParquetFile(meta_entry["modified_path"])
+            total_rows = parquet_file.metadata.num_rows
+            schema_names = parquet_file.schema.names
+
+            gsm_filter = {
+                gsm
+                for g in st.session_state.current_gpl.keys()
+                for gsm in meta.get("gsm_gpl_dict", {}).get(g, [])
+            }
+
+            if gsm_filter == set():
+                gsm_filter = set(meta.get("gsm_ids", []))
+
+            all_cols = []
+            for col in schema_names:
+                if "GSM" not in col.upper():
+                    all_cols.append(col)
+                else:
+                    match = re.search(r"GSM\d+", col, re.IGNORECASE)
+                    if match and match.group(0).upper() in gsm_filter:
+                        all_cols.append(col)
+            total_cols = len(all_cols)
+
+            if "Name" in all_cols[:PREVIEW_COLUMNS]:
+                preview_cols = all_cols[:PREVIEW_COLUMNS]
+            else:
+                preview_cols = ["Name"] + all_cols[:PREVIEW_COLUMNS-1]
+
+            if total_rows > PREVIEW_ROWS or total_cols > PREVIEW_COLUMNS:
+                st.caption(
+                    f"Showing {min(total_rows, PREVIEW_ROWS):,}/{total_rows:,} rows and "
+                    f"{len(preview_cols):,}/{total_cols:,} columns. The download contains the complete matrix."
+                )
+
+            dataset = ds.dataset(meta_entry["modified_path"], format="parquet")
+            preview_table = dataset.head(PREVIEW_ROWS, columns=preview_cols)
+
+            st.dataframe(
+                preview_table.to_pandas(),
+                width="stretch",
+                hide_index=True,
+                column_config={"Name": st.column_config.TextColumn("Name", pinned=True, width="small")},
+            )
+
+
+            current_norm = st.session_state.get(f"norm_type_{i}", "none")
+            norm_suffix = f"_{current_norm}" if current_norm != "none" else ""
+
+            # st.download_button(
+            #     label="⬇ Download complete matrix (.txt.gz)",
+            #     key=f"download_{i}",
+            #     data=StreamWrapper(stream_parquet_to_tsv_gz(meta_entry["modified_path"])),
+            #     file_name=f"{gse_id}_{original_normalization}{norm_suffix}.txt.gz",
+            #     mime="application/gzip",
+            # )
