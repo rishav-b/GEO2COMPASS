@@ -296,63 +296,86 @@ except RuntimeError as exc:
     st.error(str(exc))
     st.stop()
 
-@st.fragment
-def column_selector(counts_path, i, gse_id, state, suffix, filter = None):
+
+def column_selector(counts_path, i, gse_id, state, suffix, filter=None):
     parquet_file = pq.ParquetFile(counts_path)
     all_columns = parquet_file.schema.names
 
     if filter is not None:
-        all_columns = [a for a in all_columns if a in filter]
+        all_columns = [col for col in all_columns if col in filter]
 
     state_key = f"selected_cols_dict_{gse_id}_{state}_{suffix}"
-    if state_key not in st.session_state:
-        st.session_state[state_key] = {col: True for col in all_columns}
 
-    st.markdown("### Select Columns to Include in Download \n" \
-    "You can search for specific columns using the search bar below. Uncheck any columns you wish to exclude from your download." \
-    "You can use the Quality Control data below to inform your column selections.")
-    search_term = st.text_input("Search columns", key=f"search_bar_{i}_{suffix}")
+    if state_key not in st.session_state:
+        st.session_state[state_key] = {
+            col: True for col in all_columns
+        }
+
+    selected_dict = st.session_state[state_key]
+
+    for col in all_columns:
+        if col not in selected_dict:
+            selected_dict[col] = True
+
+    st.markdown(
+        "### Select Columns to Include in Download\n"
+        "You can search for specific columns using the search bar below. "
+        "Uncheck any columns you wish to exclude from your download. "
+        "You can use the Quality Control data below to inform your selections."
+    )
+
+    search_term = st.text_input(
+        "Search columns",
+        key=f"search_bar_{i}_{suffix}"
+    )
 
     filtered_columns = [
         col for col in all_columns
         if search_term.lower() in col.lower()
-    ] if search_term else list(all_columns)
-
+    ] if search_term else all_columns
 
     def select_all():
         for col in filtered_columns:
-            st.session_state[state_key][col] = True
-            st.session_state[f"ui_{col}_{i}_{suffix}_key"] = True
-        st.session_state["_force_full_rerun"] = True 
+            selected_dict[col] = True
+            st.session_state[
+                f"ui_{col}_{i}_{suffix}_key"
+            ] = True
 
     def deselect_all():
         for col in filtered_columns:
-            st.session_state[state_key][col] = False
-            st.session_state[f"ui_{col}_{i}_{suffix}_key"] = False
-        st.session_state["_force_full_rerun"] = True 
+            selected_dict[col] = False
+            st.session_state[
+                f"ui_{col}_{i}_{suffix}_key"
+            ] = False
 
     col1, col2 = st.columns(2)
+
     with col1:
-        st.button("Select All", on_click=select_all, key=f"select_all_{i}_{suffix}")
+        st.button(
+            "Select All",
+            on_click=select_all,
+            key=f"select_all_{i}_{suffix}"
+        )
+
     with col2:
-        st.button("Deselect All", on_click=deselect_all, key=f"deselect_all_{i}_{suffix}")
+        st.button(
+            "Deselect All",
+            on_click=deselect_all,
+            key=f"deselect_all_{i}_{suffix}"
+        )
 
     with st.expander("Show All Columns", expanded=False):
         num_grid_cols = 4
         grid_columns = st.columns(num_grid_cols)
 
         for idx, col in enumerate(filtered_columns):
-            def update_single_col(c=col):
-                st.session_state[state_key][c] = st.session_state[f"ui_{c}_{i}_{suffix}_key"]
-                st.session_state["_force_full_rerun"] = True 
-        
-
             widget_key = f"ui_{col}_{i}_{suffix}_key"
 
-            if col not in st.session_state[state_key]:
-                st.session_state[state_key][col] = True
+            if widget_key not in st.session_state:
+                st.session_state[widget_key] = selected_dict[col]
 
-            st.session_state[widget_key] = st.session_state[state_key][col]
+            def update_single_col(c=col, wk=widget_key):
+                selected_dict[c] = st.session_state[wk]
 
             with grid_columns[idx % num_grid_cols]:
                 st.checkbox(
@@ -363,10 +386,11 @@ def column_selector(counts_path, i, gse_id, state, suffix, filter = None):
 
     selected_columns = [
         col for col in all_columns
-        if st.session_state[state_key].get(col, True)
+        if selected_dict.get(col, True)
     ]
 
     return selected_columns
+
 
 MAX_ROWS_FOR_QC = 5000
 SILHOUETTE_WARNING = 0.5
@@ -580,120 +604,179 @@ def get_txt_gz_stream(parquet_path: str, columns):
 
     return data
 
+
 @st.dialog("Download Data", width="large")
 def download_dialog():
+
     if st.session_state.result_lists is not None:
+
         result_lists = st.session_state.result_lists
-        current_norms = []
-        for i in range(len(result_lists)):
-            current_norms.append(st.session_state.get(f"norm_type_{i}", "none"))
-            
-        def prep_download(i, meta_entry, columns = None):
+
+        current_norms = [
+            st.session_state.get(f"norm_type_{i}", "none")
+            for i in range(len(result_lists))
+        ]
+
+        def prep_download(i, meta_entry, columns=None):
             current_norm = current_norms[i]
-            norm_suffix = f"_{current_norm}" if current_norm != "none" else ""
+            norm_suffix = (
+                f"_{current_norm}"
+                if current_norm != "none"
+                else ""
+            )
+
             return (
-                f"download_{i}", 
-                "placeholder", 
+                f"download_{i}",
+                "placeholder",
                 f"{gse_id}_{meta_entry['normalization_type']}{norm_suffix}.txt.gz",
                 meta_entry
             )
-        
-        select_dict = {}
-        for i, meta_entry in enumerate(result_lists):
-            select_dict[meta_entry["filename"]] = (i, meta_entry)
+
+        select_dict = {
+            meta_entry["filename"]: (i, meta_entry)
+            for i, meta_entry in enumerate(result_lists)
+        }
 
         selected_path = st.selectbox(
             "Which dataset would you like to download?",
-            options = [x["filename"] for x in result_lists],
-            key = "selected_path_for_download"
+            options=[x["filename"] for x in result_lists],
+            key="selected_path_for_download"
         )
 
+        meta_entry = select_dict[selected_path][1]
+        modified_path = meta_entry["modified_path"]
+
         char_df = st.session_state.char_df.copy()
+
         gsm_filter = []
+
         for g in list(st.session_state.current_gpl.keys()):
             if g != "ncbi":
-                gsm_filter.extend(meta["gsm_gpl_dict"][g])
+                gsm_filter.extend(
+                    meta["gsm_gpl_dict"][g]
+                )
+
         if not gsm_filter:
-            gsm_filter = meta["gsm_ids"]
+            gsm_filter = meta_entry["gsm_ids"]
 
-        print(char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")])
+        qc_filter = (
+            char_df.index.isin(gsm_filter)
+            | ~char_df.index.str.startswith("GSM")
+        )
 
-        state_key = f"selected_cols_dict_{gse_id}_qc_{selected_path}"
-        modified_path = select_dict[selected_path][1]["modified_path"]
+        qc_df = char_df.loc[qc_filter]
+
+        state_key = (
+            f"selected_cols_dict_{gse_id}_qc_{selected_path}"
+        )
 
         if state_key not in st.session_state:
             parquet_file = pq.ParquetFile(modified_path)
             all_columns = parquet_file.schema.names
-            filter_cols = char_df.index[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")]
-            filtered_cols = [a for a in all_columns if a in filter_cols] if filter_cols is not None else all_columns
-            st.session_state[state_key] = {col: True for col in filtered_cols}
+
+            filter_cols = qc_df.index.tolist()
+
+            filtered_cols = [
+                col for col in all_columns
+                if col in filter_cols
+            ]
+
+            st.session_state[state_key] = {
+                col: True for col in filtered_cols
+            }
 
         selected_columns = column_selector(
-            modified_path, "download", gse_id, "qc", selected_path,
-            char_df.index[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")]
+            modified_path,
+            "download",
+            gse_id,
+            "qc",
+            selected_path,
+            qc_df.index.tolist()
         )
 
-        state_key = f"selected_cols_dict_{gse_id}_qc_{selected_path}"
-        if state_key not in st.session_state:
-            st.session_state[state_key] = {col: True for col in selected_columns}
-        
-        # Generate the bytes directly using the currently selected columns
-        download_bytes = get_txt_gz_stream(modified_path, columns=selected_columns)
-        
-        res = prep_download(select_dict[selected_path][0], select_dict[selected_path][1], columns=selected_columns)
-        
+        export_columns = list(selected_columns)
+
+        if "Name" not in export_columns:
+            export_columns.insert(0, "Name")
+
+        if not selected_columns:
+            st.warning(
+                "Please select at least one column to download."
+            )
+            return
+
+        download_bytes = get_txt_gz_stream(
+            modified_path,
+            columns=export_columns
+        )
+
+        res = prep_download(
+            select_dict[selected_path][0],
+            meta_entry,
+            columns=export_columns
+        )
+
         if res is not None:
-            qc_meta_entry = res[3]
+
             qc(
-                char_df.loc[char_df.index.isin(gsm_filter) | ~char_df.index.str.startswith("GSM")], 
-                gse_id, 
-                qc_meta_entry["path"], 
-                qc_meta_entry["modified_path"], 
-                qc_meta_entry["normalization_type"], 
+                qc_df,
+                gse_id,
+                meta_entry["path"],
+                modified_path,
+                meta_entry["normalization_type"],
                 selected_columns
             )
-            if st.session_state.get("_force_full_rerun"):
-                st.session_state["_force_full_rerun"] = False
-                st.rerun()
 
             st.markdown(
-                "### Download Dataset \n" \
-                "Click the button below to download the dataset as a tab-separated text file. " \
-                "The file will be compressed using gzip to reduce download size."
+                "### Download Dataset\n"
+                "Click the button below to download the dataset "
+                "as a tab-separated text file. "
+                "The file will be compressed using gzip."
             )
-            
+
+            st.caption(
+                f"{len(export_columns)} columns selected for export."
+            )
+
             st.download_button(
                 label="Download Dataset ⬇",
                 key=res[0],
-                data=download_bytes,  # Pass the generated bytes directly
+                data=download_bytes,
                 file_name=res[2],
-                mime="application/gzip",
+                mime="application/gzip"
             )
 
+        # provenance download
         if st.session_state.get("record_log"):
+
             st.markdown(
-                "### Download Provenance Record \n"
-                "Click the button below to download a JSON file containing a record of the actions "
-                "taken during the analysis. This can be used for reproducibility and tracking of the analysis steps."
+                "### Download Provenance Record\n"
+                "Click below to download a JSON file containing "
+                "a record of the actions taken during the analysis."
             )
 
             record_payload = {
                 "gse_id": gse_id,
                 "accessed": datetime.now(timezone.utc).isoformat(),
-                "tool_version": "geo-2-compass-0.1", 
+                "tool_version": "geo-2-compass-0.1",
                 "events": st.session_state.record_log,
             }
+
             st.download_button(
                 label="⬇ Download provenance (.json)",
-                data=json.dumps(record_payload, indent=2, default=str),
+                data=json.dumps(
+                    record_payload,
+                    indent=2,
+                    default=str
+                ),
                 file_name=f"{gse_id}_record.json",
                 mime="application/json",
-                key="download_record",
+                key="download_record"
             )
 
-            
     else:
         st.info("No results available yet.")
+
 
 meta = fetch_metadata(gse_id, GLOBAL_GSE)
 
@@ -895,6 +978,7 @@ def fetch_hgnc_table() -> pd.DataFrame:
     return df[["hgnc_id", "symbol", "prev_symbol", "alias_symbol"]]
  
 def gene_convert(gpl_df, gse, best_col, symbol_col):
+    print("HALLUCINATION")
     for gpl_name, gpl in getattr(gse, "gpls", {}).items():
         try:
             species = gpl.metadata.get('organism', [])[0]
@@ -915,7 +999,14 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
     numeric_namespace = None
     if (bool(re.match(r"^\d+(_at)?$", id))):
         numeric_namespace = "ENTREZGENE_ACC"
-    if (bool(re.match(r"^ENSG\d{11}(\.\d+)?$", id)) or bool(re.match(r"^ENSMUSG\d{11}(\.\d+)?$", id))):
+    if (bool(re.match(r"^ENSG\d{11}(\.\d+)?$", id))):
+        target_namespace = "HGNC"
+        species = "hsapiens"
+        numeric_namespace = "ENSEMBL"
+    if (bool(re.match(r"^ENSMUSG\d{11}(\.\d+)?$", id))):
+        print("NO RETURN")
+        target_namespace = "MGI"
+        species = "mmusculus"
         numeric_namespace = "ENSEMBL"
     if (id.strip()[:3].lower() == "eg:"):
         numeric_namespace = "ENTREZGENE_ACC"
@@ -929,6 +1020,8 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
             .str.replace(r"_at$", "", regex=True)
             .str.replace(r"\.\d+$", "", regex=True)
         )
+        print("SUIATSU")
+        print(gpl_df["new_id_col"].head())
         if (str(gpl_df[best_col].iloc[0]).strip()[:3].lower() == "eg:"):
             gpl_df["new_id_col"] = gpl_df[best_col].astype(str).str.split(':').str[1]
  
@@ -951,8 +1044,10 @@ def gene_convert(gpl_df, gse, best_col, symbol_col):
  
         results_deduped = results.drop_duplicates(subset="incoming", keep="first")
         mapping = results_deduped.set_index("incoming")["name"]
+        print(mapping.head())
  
         gpl_df["gene_symbol"] = [mapping.get(id_, float("nan")) for id_ in gpl_df["new_id_col"]]
+        print(gpl_df["gene_symbol"].head())
 
         mapped_count = int(gpl_df["gene_symbol"].notna().sum())
         log_record(
