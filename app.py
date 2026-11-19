@@ -1649,6 +1649,13 @@ def fetch_and_normalize(
  
     candidates = _scrape_geo_download_page(accession)
     dp_norm_info = detect_normalization(dp_text=dp_text)
+
+    if gsm_ids is not None:
+        title_gsm_map = {}
+        for gsm_id, gsm_obj in GLOBAL_GSE.gsms.items():
+            title = gsm_obj.metadata.get("title", [""])[0]
+            title_gsm_map[title] = gsm_obj.name
+
     if not candidates:
         return []
  
@@ -1695,11 +1702,12 @@ def fetch_and_normalize(
             return None
  
         counts_df, gpl_results = _annotate_counts(accession, selected, counts_df, all_selected_gpls)
- 
+
         retained_cols = [
             col for col in counts_df.columns
             if "gsm" not in col.lower() or any(gsm in col for gsm in gsm_ids)
         ]
+
 
         column_map = {}
 
@@ -1719,6 +1727,19 @@ def fetch_and_normalize(
         counts_df = counts_df[retained_cols]
 
         counts_df = counts_df.rename(columns = column_map)
+        counts_df = counts_df.rename(columns=title_gsm_map)
+
+        columns = list(counts_df.columns)
+
+        for i in range(len(columns) - 1):
+            if "gsm" in columns[i].lower() and "gsm" not in columns[i+1].lower():
+                try:
+                    columns[i+1] = f"GSM{int(columns[i][3:]) + 1}"
+                except (ValueError, TypeError):
+                    pass
+
+        counts_df.columns = columns
+
         counts_df.index.name = None
         counts_df.insert(0, "Name", counts_df.index)
         counts_df.reset_index(drop=True, inplace=True)
